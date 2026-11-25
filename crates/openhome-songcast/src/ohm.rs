@@ -167,6 +167,10 @@ impl AudioFlags {
         (self.0 & Self::RESENT) != 0
     }
 
+    pub fn is_timestamped2(self) -> bool {
+        (self.0 & Self::TIMESTAMPED2) != 0
+    }
+
     pub fn with_resent(self) -> Self {
         Self(self.0 | Self::RESENT)
     }
@@ -323,7 +327,10 @@ fn decode_audio(payload: &[u8]) -> Result<OhmAudio, SongcastError> {
     let volume_offset = i16::from_be_bytes([payload[44], payload[45]]);
     let bit_depth = payload[46];
     let channels = payload[47];
-    // payload[48] is reserved
+    let reserved = payload[48];
+    if reserved != 0 {
+        return Err(SongcastError::InvalidAudioHeaderLength(reserved));
+    }
     let codec_len = payload[49] as usize;
     let codec_end = OHM_AUDIO_SUBHEADER_BYTES + codec_len;
     if payload.len() < codec_end {

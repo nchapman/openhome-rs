@@ -15,9 +15,15 @@ pub const TICKS_PER_SEC_48K: u64 = 48_000 * 256;
 /// Default Songcast pipeline latency in milliseconds when `media_latency == 0`.
 pub const DEFAULT_LATENCY_MS: u32 = 100;
 
-/// Return the Songcast tick rate (ticks/sec) for `sample_rate`.
+/// Return the Songcast tick rate (ticks/sec) for `sample_rate`, matching
+/// `ohPipeline`'s `Jiffies::SongcastTicksPerSecond`.
 pub fn songcast_ticks_per_sec(sample_rate: u32) -> u64 {
-    if sample_rate > 0 && sample_rate.is_multiple_of(441) {
+    if sample_rate > 0
+        && (matches!(
+            sample_rate,
+            7_350 | 11_025 | 14_700 | 22_050 | 29_400 | 44_100 | 88_200 | 176_400 | 352_800
+        ) || sample_rate.is_multiple_of(441))
+    {
         TICKS_PER_SEC_44K
     } else {
         TICKS_PER_SEC_48K
@@ -174,10 +180,14 @@ mod tests {
 
     #[test]
     fn tick_math_matches_44k_and_48k_families() {
-        assert_eq!(songcast_ticks_per_sec(44_100), TICKS_PER_SEC_44K);
-        assert_eq!(songcast_ticks_per_sec(88_200), TICKS_PER_SEC_44K);
-        assert_eq!(songcast_ticks_per_sec(48_000), TICKS_PER_SEC_48K);
-        assert_eq!(songcast_ticks_per_sec(96_000), TICKS_PER_SEC_48K);
+        for r44 in [
+            7_350, 11_025, 14_700, 22_050, 29_400, 44_100, 88_200, 176_400,
+        ] {
+            assert_eq!(songcast_ticks_per_sec(r44), TICKS_PER_SEC_44K, "rate {r44}");
+        }
+        for r48 in [8_000, 16_000, 32_000, 48_000, 96_000, 192_000] {
+            assert_eq!(songcast_ticks_per_sec(r48), TICKS_PER_SEC_48K, "rate {r48}");
+        }
 
         let ticks = latency_ms_to_ticks(100, 48_000);
         assert_eq!(ticks, 1_228_800);

@@ -374,7 +374,9 @@ impl SongcastSender {
         }
         match self.multicast_dest {
             Some(mc) => vec![mc],
-            None => st.receivers.keys().copied().collect(),
+            // Per ohSongcast/ohPipeline, unicast sender streams only to the primary
+            // receiver, which fans out to the Slave list.
+            None => st.primary.into_iter().collect(),
         }
     }
 

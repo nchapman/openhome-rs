@@ -126,6 +126,8 @@ impl SongcastReceiver {
             let mut reorder = ReorderBuffer::new(config.max_backlog_frames);
             let mut clock = ClockSync::new(48_000);
             let mut current_rate: u32 = 48_000;
+            // Unicast primary relays Audio/Track/Metatext to slaves (ohSongcast Broadcast()).
+            let mut slaves: Vec<SocketAddrV4> = Vec::new();
 
             let mut join_tick = tokio::time::interval(config.join_interval);
             join_tick.reset();
@@ -164,7 +166,15 @@ impl SongcastReceiver {
                         let Ok(msg) = OhmMessage::decode(&buf[..len]) else { continue };
 
                         match msg {
+                            OhmMessage::Slave(list) if !is_multicast => {
+                                slaves = list;
+                            }
                             OhmMessage::Track(track) => {
+                                if !is_multicast && !slaves.is_empty() {
+                                    for &slave in &slaves {
+                                        let _ = socket.send_to(&buf[..len], SocketAddr::V4(slave)).await;
+                                    }
+                                }
                                 joined_track = true;
                                 if last_track_seq != Some(track.sequence) {
                                     last_track_seq = Some(track.sequence);
@@ -172,6 +182,11 @@ impl SongcastReceiver {
                                 }
                             }
                             OhmMessage::Metatext(mt) => {
+                                if !is_multicast && !slaves.is_empty() {
+                                    for &slave in &slaves {
+                                        let _ = socket.send_to(&buf[..len], SocketAddr::V4(slave)).await;
+                                    }
+                                }
                                 joined_metatext = true;
                                 if last_meta_seq != Some(mt.sequence) {
                                     last_meta_seq = Some(mt.sequence);
@@ -179,6 +194,11 @@ impl SongcastReceiver {
                                 }
                             }
                             OhmMessage::Audio(audio) => {
+                                if !is_multicast && !slaves.is_empty() {
+                                    for &slave in &slaves {
+                                        let _ = socket.send_to(&buf[..len], SocketAddr::V4(slave)).await;
+                                    }
+                                }
                                 match reorder.push(audio) {
                                     PushOutcome::Ready(frames) => {
                                         for frame in frames {
@@ -218,6 +238,10 @@ impl SongcastReceiver {
                             OhmMessage::Listen if is_multicast => {
                                 // Master/slave suppression: another multicast receiver just sent Listen.
                                 listen_tick.reset();
+                            }
+                            OhmMessage::Resend(_) if is_multicast && reorder.has_gaps() => {
+                                // ResendSeen suppression: defer our own resend timer when a peer requests resend.
+                                repair_tick.reset();
                             }
                             _ => {}
                         }

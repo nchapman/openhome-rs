@@ -88,6 +88,9 @@ impl ReorderBuffer {
         }
 
         // Frame arrived ahead of expected sequence (gap).
+        if self.pending.contains_key(&frame.frame) {
+            return PushOutcome::Duplicate;
+        }
         if (diff as usize) > self.max_backlog || self.pending.len() >= self.max_backlog {
             // Backlog overflow -> resync to the new frame (matches ohSongcast RepairReset).
             self.pending.clear();
@@ -184,6 +187,8 @@ mod tests {
 
         // Gap: 101 and 102 missing, 103 arrives.
         assert_eq!(buf.push(mk_frame(103, false)), PushOutcome::GapDetected);
+        // Duplicate of an already-pending frame is dropped without re-triggering resend.
+        assert_eq!(buf.push(mk_frame(103, false)), PushOutcome::Duplicate);
         assert!(buf.has_gaps());
         assert_eq!(buf.missing_frames(20), vec![101, 102]);
         assert_eq!(buf.missing_frames(1), vec![101]);

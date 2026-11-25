@@ -50,7 +50,7 @@ pub fn encode_sender_metadata(
     out.push_str(
         r#"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">"#,
     );
-    out.push_str(r#"<item id="0" parentID="-1" restricted="True"><dc:title>"#);
+    out.push_str(r#"<item id="0" restricted="True"><dc:title>"#);
     out.push_str(&escape_xml(title));
     out.push_str(r#"</dc:title><res protocolInfo=""#);
     out.push_str(protocol_info);

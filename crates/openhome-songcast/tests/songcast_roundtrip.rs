@@ -329,7 +329,7 @@ async fn stream_interrupted_resyncs_receiver_and_handles_sample_rate_change() {
 }
 
 #[tokio::test]
-async fn unicast_multiple_receivers_slave_list_and_null_uri_error() {
+async fn unicast_primary_relays_to_slave_and_promotes_on_leave() {
     assert!(matches!(
         SongcastReceiver::connect(&SongcastUri::Null, ReceiverConfig::default()).await,
         Err(SongcastError::InvalidUri(_))
@@ -342,32 +342,70 @@ async fn unicast_multiple_receivers_slave_list_and_null_uri_error() {
     .await
     .unwrap();
 
-    // Join two raw UDP peers to inspect Slave list + primary promotion on Leave.
-    let p1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let p2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let dest = SocketAddr::V4(sender.local_addr());
+    let cfg = ReceiverConfig {
+        join_interval: Duration::from_millis(40),
+        ..ReceiverConfig::default()
+    };
 
-    let join = OhmMessage::Join.encode().unwrap();
-    let listen = OhmMessage::Listen.encode().unwrap();
-    let leave = OhmMessage::Leave.encode().unwrap();
+    // Connect primary receiver first, wait until registered.
+    let mut primary = SongcastReceiver::connect(&sender.uri(), cfg.clone())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sender.active_receivers() < 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
-    p1.send_to(&join, dest).await.unwrap();
-    p2.send_to(&join, dest).await.unwrap();
-    p2.send_to(&listen, dest).await.unwrap();
-
+    // Connect slave receiver second; sender sends Slave([slave]) to primary.
+    let mut slave = SongcastReceiver::connect(&sender.uri(), cfg).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while sender.active_receivers() < 2 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(sender.active_receivers(), 2);
 
-    // Primary leaves -> p2 promoted and remains active.
-    p1.send_to(&leave, dest).await.unwrap();
+    // Give primary a moment to ingest the Slave message, then stream Track, Metatext, and frame 0.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    sender
+        .set_track("http://127.0.0.1/relay.flac", "<DIDL-Lite>R</DIDL-Lite>")
+        .await
+        .unwrap();
+    sender.set_metatext("Relayed Metatext").await.unwrap();
+    let fmt = AudioFormat::pcm(48_000, 16, 2);
+    sender
+        .send_audio(&fmt, vec![0xAB; 64], false)
+        .await
+        .unwrap();
+
+    // Both primary AND slave (via primary relay!) receive frame 0.
+    async fn next_audio_frame(rx: &mut SongcastReceiver) -> u32 {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("audio frame arrived")
+                .unwrap();
+            if let ReceiverEvent::Audio { frame, .. } = ev {
+                return frame.frame;
+            }
+        }
+    }
+    assert_eq!(next_audio_frame(&mut primary).await, 0);
+    assert_eq!(next_audio_frame(&mut slave).await, 0);
+
+    // Primary leaves -> sender promotes slave to primary and streams frame 1 directly.
+    primary.shutdown().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while sender.active_receivers() != 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(sender.active_receivers(), 1);
 
+    sender
+        .send_audio(&fmt, vec![0xCD; 64], false)
+        .await
+        .unwrap();
+    assert_eq!(next_audio_frame(&mut slave).await, 1);
+
+    slave.shutdown().await;
     sender.shutdown().await;
 }

@@ -133,12 +133,14 @@ pub async fn resolve_zone(
     zone: &str,
     timeout: Duration,
 ) -> Result<SongcastUri, SongcastError> {
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
     let is_multicast = endpoint.ip().is_multicast();
-    if is_multicast {
-        let _ = sock.set_multicast_loop_v4(true);
-        let _ = sock.set_multicast_ttl_v4(2);
-    }
+    // Per ohSongcast / ohPipeline, OHZ ZoneUri replies are multicast to the OHZ group
+    // (239.255.255.250:51972), so multicast queries must join the group to receive them.
+    let sock = if is_multicast {
+        bind_udp_v4(endpoint, Ipv4Addr::UNSPECIFIED, 2)?
+    } else {
+        UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?
+    };
     let query = OhzMessage::ZoneQuery {
         zone: zone.to_string(),
     }
@@ -186,12 +188,12 @@ pub async fn query_preset(
     preset: u32,
     timeout: Duration,
 ) -> Result<Option<String>, SongcastError> {
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
     let is_multicast = endpoint.ip().is_multicast();
-    if is_multicast {
-        let _ = sock.set_multicast_loop_v4(true);
-        let _ = sock.set_multicast_ttl_v4(2);
-    }
+    let sock = if is_multicast {
+        bind_udp_v4(endpoint, Ipv4Addr::UNSPECIFIED, 2)?
+    } else {
+        UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?
+    };
     let query = OhzMessage::PresetQuery { preset }.encode()?;
 
     let deadline = tokio::time::Instant::now() + timeout;
