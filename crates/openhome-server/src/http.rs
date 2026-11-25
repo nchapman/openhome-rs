@@ -222,7 +222,7 @@ fn handle_subscribe(
     }
 
     // Initial subscription requires NT: upnp:event and at least one valid HTTP CALLBACK URL.
-    if nt != Some("upnp:event") {
+    if !nt.is_some_and(|v| v.eq_ignore_ascii_case("upnp:event")) {
         return empty_response(StatusCode::PRECONDITION_FAILED, &state.server_header);
     }
     let callbacks = callback.map(parse_callback_header).unwrap_or_default();

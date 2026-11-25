@@ -145,6 +145,23 @@ mod tests {
         );
         assert_eq!(parse_timeout_header("Second-1800"), Some(1800));
         assert_eq!(parse_timeout_header("Second-infinite"), None);
+        assert_eq!(parse_timeout_header("second-60"), Some(60));
+        assert_eq!(parse_timeout_header("Second-0"), None);
+        assert_eq!(parse_timeout_header("garbage"), None);
         assert_eq!(format_timeout_header(300), "Second-300");
+
+        // HTTPS and non-HTTP URLs or malformed brackets are filtered out.
+        assert_eq!(
+            parse_callback_header(
+                "<https://1.2.3.4/cb><ftp://x><http://1.2.3.4:9/ok><http://unclosed"
+            ),
+            vec!["http://1.2.3.4:9/ok"]
+        );
+
+        // Empty self-closing property, CDATA property, and multiple vars in one <e:property>.
+        let xml = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><Empty/><Meta><![CDATA[<DIDL/>]]></Meta></e:property></e:propertyset>"#;
+        let decoded = decode_propertyset(xml).unwrap();
+        assert_eq!(decoded.get("Empty").map(String::as_str), Some(""));
+        assert_eq!(decoded.get("Meta").map(String::as_str), Some("<DIDL/>"));
     }
 }

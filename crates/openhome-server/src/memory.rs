@@ -261,6 +261,14 @@ impl MemoryRenderer {
             .min(inner.volume_state.volume_limit);
     }
 
+    /// Customize `VolumeLimit` (clamped to `VolumeMax`; also clamps current volume).
+    pub fn set_volume_limit(&self, limit: u32) {
+        let mut inner = self.inner.write().unwrap();
+        let clamped = limit.min(inner.volume_chars.volume_max);
+        inner.volume_state.volume_limit = clamped;
+        inner.volume_state.volume = inner.volume_state.volume.min(clamped);
+    }
+
     /// Update current track stream details (increments `DetailsCount`).
     pub fn set_track_details(&self, details: TrackDetails) {
         let mut inner = self.inner.write().unwrap();
@@ -610,11 +618,14 @@ impl PlaylistService for MemoryRenderer {
 
     fn delete_all(&self) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
+        let had_tracks = !inner.tracks.is_empty();
         inner.tracks.clear();
         inner.total_track_bytes = 0;
         inner.clear_current_track();
         inner.transport_state = TransportState::Stopped;
-        inner.id_array_token = inner.id_array_token.wrapping_add(1);
+        if had_tracks {
+            inner.id_array_token = inner.id_array_token.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -789,5 +800,115 @@ impl SenderService for MemoryRenderer {
 
     fn attributes(&self) -> String {
         self.inner.read().unwrap().sender_attributes.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playlist_repeat_wrap_delete_current_standby_and_seek_edges() {
+        let r = MemoryRenderer::new("Room", "Player");
+        let id1 = r.insert(0, "http://x/1.flac".into(), "".into()).unwrap();
+        let id2 = r.insert(id1, "http://x/2.flac".into(), "".into()).unwrap();
+
+        PlaylistService::play(&r).unwrap();
+        assert_eq!(r.current_id(), id1);
+
+        // Repeat = false: previous at index 0 resets seconds to 0; next at end stops.
+        r.seek_second_absolute(42).unwrap();
+        r.previous().unwrap();
+        assert_eq!(r.current_id(), id1);
+        assert_eq!(r.time().seconds, 0);
+
+        r.next().unwrap();
+        assert_eq!(r.current_id(), id2);
+        r.next().unwrap();
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Stopped
+        );
+
+        // Repeat = true: wraps both directions.
+        PlaylistService::play(&r).unwrap();
+        r.set_repeat(true).unwrap();
+        r.next().unwrap();
+        assert_eq!(r.current_id(), id1);
+        r.previous().unwrap();
+        assert_eq!(r.current_id(), id2);
+
+        // SeekSecondAbsolute > duration returns 803 Seek failed; relative clamps to [0, duration].
+        r.set_track_details(TrackDetails {
+            duration: 100,
+            ..TrackDetails::default()
+        });
+        assert_eq!(
+            r.seek_second_absolute(101).unwrap_err().code,
+            Fault::SEEK_FAILED
+        );
+        r.seek_second_absolute(90).unwrap();
+        r.seek_second_relative(50).unwrap();
+        assert_eq!(r.time().seconds, 100);
+        r.seek_second_relative(-500).unwrap();
+        assert_eq!(r.time().seconds, 0);
+
+        // DeleteId of currently playing track advances cleanly; deleting last stops playback.
+        r.delete_id(id2).unwrap();
+        assert_eq!(r.current_id(), id1);
+        r.delete_id(id1).unwrap();
+        assert_eq!(r.current_id(), 0);
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Stopped
+        );
+
+        // DeleteAll on already-empty playlist does not churn IdArray token.
+        let (tok_before, _) = r.id_array();
+        r.delete_all().unwrap();
+        let (tok_after, _) = r.id_array();
+        assert_eq!(tok_before, tok_after);
+
+        // Standby stops both Playlist and Receiver playback.
+        r.insert(0, "http://x/3.flac".into(), "".into()).unwrap();
+        PlaylistService::play(&r).unwrap();
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Playing
+        );
+        r.set_standby(true).unwrap();
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Stopped
+        );
+
+        r.set_sender("ohz://239.255.255.250:51972/z".into(), "".into())
+            .unwrap();
+        ReceiverService::play(&r).unwrap();
+        assert_eq!(ReceiverService::transport_state(&r), ReceiverState::Playing);
+        r.set_standby(true).unwrap();
+        assert_eq!(ReceiverService::transport_state(&r), ReceiverState::Stopped);
+    }
+
+    #[test]
+    fn volume_limit_floor_and_receiver_size_limits() {
+        let r = MemoryRenderer::new("Room", "Amp");
+        r.set_volume_limit(30);
+        assert_eq!(r.state().volume, 30);
+
+        r.set_volume(80).unwrap();
+        assert_eq!(r.state().volume, 30);
+        r.volume_inc().unwrap();
+        assert_eq!(r.state().volume, 30);
+
+        r.set_volume(0).unwrap();
+        r.volume_dec().unwrap();
+        assert_eq!(r.state().volume, 0);
+
+        let huge = "x".repeat(MAX_URI_BYTES + 1);
+        assert_eq!(
+            r.set_sender(huge, String::new()).unwrap_err().code,
+            Fault::INVALID_ARGS
+        );
     }
 }

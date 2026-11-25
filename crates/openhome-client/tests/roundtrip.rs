@@ -2,21 +2,31 @@
 //! `openhome-server` over real loopback TCP (HTTP/1.1 SOAP + GENA) and UDP (SSDP).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, StatusCode};
+use hyper_util::rt::TokioIo;
 use openhome_client::{
-    ClientError, DiscoveryOptions, EventListener, OpenHomeDevice, Topology, discover,
+    ClientError, DiscoveryOptions, EventListener, HttpClient, OpenHomeDevice, ProductClient,
+    Topology, discover,
 };
 use openhome_core::id_array::decode_id_array;
+use openhome_core::soap::decode_soap_fault;
+use openhome_core::ssdp::{SsdpMessage, decode_ssdp_packet, encode_msearch};
 use openhome_core::urn::{
-    DEVICE_SOURCE_1, SERVICE_INFO_1, SERVICE_PLAYLIST_1, SERVICE_PRODUCT_1, SERVICE_RECEIVER_1,
-    SERVICE_SENDER_1, SERVICE_TIME_1, SERVICE_VOLUME_1,
+    DEVICE_SOURCE_1, SERVICE_INFO_1, SERVICE_PLAYLIST_1, SERVICE_PRODUCT_1, SERVICE_PRODUCT_2,
+    SERVICE_RECEIVER_1, SERVICE_SENDER_1, SERVICE_TIME_1, SERVICE_VOLUME_1, SSDP_ALL,
+    UPNP_ROOT_DEVICE,
 };
 use openhome_core::{
-    Fault, ReceiverState, SenderStatus, SourceType, TrackDetails, TransportState,
-    VolumeCharacteristics,
+    DeviceAttributes, DeviceDescription, Fault, ProductInfo, ReceiverState, SenderStatus,
+    ServiceDescription, Source, SourceType, TrackDetails, TransportState, VolumeCharacteristics,
 };
-use openhome_server::{MemoryRenderer, OpenHomeServer, SsdpConfig};
+use openhome_server::{MemoryRenderer, OpenHomeServer, ProductService, SsdpConfig};
+use tokio::net::{TcpStream, UdpSocket};
 
 async fn start_test_server(room: &str, name: &str) -> (MemoryRenderer, OpenHomeServer) {
     let renderer = MemoryRenderer::new(room, name);
@@ -683,4 +693,493 @@ async fn regression_next_unselected_readlist_dedup_insert_limits_and_ssrf_guard(
     assert_eq!(server.events().active_subscription_count(), 0);
 
     server.shutdown().await;
+}
+
+async fn raw_http(
+    addr: SocketAddr,
+    req: Request<Full<Bytes>>,
+) -> (StatusCode, hyper::HeaderMap, Bytes) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, body)
+}
+
+#[tokio::test]
+async fn raw_http_status_codes_and_gena_protocol_errors() {
+    let (_renderer, server) = start_test_server("Lab", "Http").await;
+    let addr = server.local_addr();
+    let host = addr.to_string();
+
+    // HEAD /description.xml -> 200 OK, non-zero Content-Length, empty body.
+    let (status, headers, body) = raw_http(
+        addr,
+        Request::builder()
+            .method("HEAD")
+            .uri("/description.xml")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    let cl: usize = headers
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(cl > 100);
+
+    // 404 on unknown paths and unknown SCPD.
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("GET")
+            .uri("/does-not-exist")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("GET")
+            .uri("/scpd/Bogus.xml")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 405 on wrong HTTP methods.
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("GET")
+            .uri("/ctl/Product")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("POST")
+            .uri("/evt/Product")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // SUBSCRIBE without NT -> 412; with SID + CALLBACK -> 400; UNSUBSCRIBE unknown SID -> 412.
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("SUBSCRIBE")
+            .uri("/evt/Product")
+            .header("HOST", &host)
+            .header("CALLBACK", "<http://127.0.0.1:9999/cb>")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("SUBSCRIBE")
+            .uri("/evt/Product")
+            .header("HOST", &host)
+            .header("SID", "uuid:abc")
+            .header("CALLBACK", "<http://127.0.0.1:9999/cb>")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = raw_http(
+        addr,
+        Request::builder()
+            .method("UNSUBSCRIBE")
+            .uri("/evt/Product")
+            .header("HOST", &host)
+            .header("SID", "uuid:does-not-exist")
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    // Malformed SOAP body returns HTTP 500 with UPnP SOAP Fault 402.
+    let (status, _, body) = raw_http(
+        addr,
+        Request::builder()
+            .method("POST")
+            .uri("/ctl/Playlist")
+            .header("HOST", &host)
+            .body(Full::new(Bytes::from_static(b"<invalid/>")))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let fault = decode_soap_fault(std::str::from_utf8(&body).unwrap())
+        .unwrap()
+        .expect("SOAP fault payload");
+    assert_eq!(fault.code, Fault::INVALID_ARGS);
+
+    server.shutdown().await;
+}
+
+struct MinimalProduct {
+    room: String,
+    name: String,
+}
+
+impl ProductService for MinimalProduct {
+    fn product_info(&self) -> ProductInfo {
+        ProductInfo {
+            product_room: self.room.clone(),
+            product_name: self.name.clone(),
+            ..ProductInfo::default()
+        }
+    }
+
+    fn attributes(&self) -> DeviceAttributes {
+        DeviceAttributes::default()
+    }
+
+    fn sources(&self) -> Vec<Source> {
+        vec![Source {
+            name: "Aux".into(),
+            source_type: SourceType::Analog,
+            visible: true,
+            system_name: "Aux".into(),
+        }]
+    }
+
+    fn source_index(&self) -> u32 {
+        0
+    }
+
+    fn set_source_index(&self, index: u32) -> openhome_server::ActionResult<()> {
+        if index == 0 {
+            Ok(())
+        } else {
+            Err(Fault::source_not_found())
+        }
+    }
+
+    fn standby(&self) -> bool {
+        true
+    }
+
+    fn set_standby(&self, _standby: bool) -> openhome_server::ActionResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn partial_service_server_and_missing_service_errors() {
+    let product = Arc::new(MinimalProduct {
+        room: "Bedroom".into(),
+        name: "Preamp".into(),
+    });
+    let server = OpenHomeServer::builder(product)
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .ssdp(SsdpConfig::disabled())
+        .start()
+        .await
+        .unwrap();
+
+    let device = OpenHomeDevice::connect(server.description_url())
+        .await
+        .unwrap();
+    assert_eq!(device.description().services.len(), 1);
+    assert!(device.is_openhome_device());
+    assert!(device.product().is_ok());
+    assert!(matches!(
+        device.playlist(),
+        Err(ClientError::MissingService(SERVICE_PLAYLIST_1))
+    ));
+    assert!(matches!(
+        device.volume(),
+        Err(ClientError::MissingService(SERVICE_VOLUME_1))
+    ));
+
+    // Unregistered services return 404 on /ctl/, /evt/, /scpd/.
+    let addr = server.local_addr();
+    let host = addr.to_string();
+    for (method, path) in [
+        ("POST", "/ctl/Playlist"),
+        ("SUBSCRIBE", "/evt/Playlist"),
+        ("GET", "/scpd/Playlist.xml"),
+    ] {
+        let (status, _, _) = raw_http(
+            addr,
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("HOST", &host)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ssdp_search_matrix_all_rootdevice_service_and_invalid_man() {
+    let renderer = MemoryRenderer::new("Hall", "Streamer");
+    let server = renderer
+        .into_server_builder()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .ssdp(SsdpConfig {
+            enabled: true,
+            multicast_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            interface: Ipv4Addr::LOCALHOST,
+            ..SsdpConfig::default()
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let ssdp_addr = server.ssdp_addr().unwrap();
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    async fn query_until(
+        sock: &UdpSocket,
+        dest: SocketAddr,
+        packet: &str,
+        expected_min: usize,
+    ) -> Vec<openhome_core::ssdp::SsdpResponse> {
+        sock.send_to(packet.as_bytes(), dest).await.unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while out.len() < expected_min {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+                Ok(Ok((len, _))) => {
+                    if let Ok(SsdpMessage::Response(r)) = decode_ssdp_packet(&buf[..len]) {
+                        out.push(r);
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    // ssdp:all -> 10 targets (rootdevice + udn + Source:1 + 7 services).
+    let all = query_until(
+        &sock,
+        ssdp_addr,
+        &encode_msearch(&ssdp_addr.to_string(), SSDP_ALL, 1),
+        10,
+    )
+    .await;
+    let sts: std::collections::HashSet<&str> = all.iter().map(|r| r.st.as_str()).collect();
+    for expected in [
+        UPNP_ROOT_DEVICE,
+        server.udn(),
+        DEVICE_SOURCE_1,
+        SERVICE_PRODUCT_1,
+        SERVICE_PLAYLIST_1,
+        SERVICE_INFO_1,
+        SERVICE_TIME_1,
+        SERVICE_VOLUME_1,
+        SERVICE_RECEIVER_1,
+        SERVICE_SENDER_1,
+    ] {
+        assert!(sts.contains(expected), "missing SSDP target {expected}");
+    }
+
+    // upnp:rootdevice -> response with USN "<udn>::upnp:rootdevice".
+    let root = query_until(
+        &sock,
+        ssdp_addr,
+        &encode_msearch(&ssdp_addr.to_string(), UPNP_ROOT_DEVICE, 1),
+        1,
+    )
+    .await;
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].st, UPNP_ROOT_DEVICE);
+    assert_eq!(root[0].usn, format!("{}::{UPNP_ROOT_DEVICE}", server.udn()));
+    assert_eq!(root[0].max_age, Some(1800));
+
+    // Standard RFC 2774 / UPnP DA 1.1 MAN header with `; ns=01` parameter must be accepted.
+    let ns_man = format!(
+        "M-SEARCH * HTTP/1.1\r\nHOST: {ssdp_addr}\r\nMAN: \"ssdp:discover\"; ns=01\r\nMX: 1\r\nST: {SERVICE_PLAYLIST_1}\r\n\r\n"
+    );
+    let pl = query_until(&sock, ssdp_addr, &ns_man, 1).await;
+    assert_eq!(pl.len(), 1);
+    assert_eq!(pl[0].st, SERVICE_PLAYLIST_1);
+
+    // M-SEARCH without valid MAN: "ssdp:discover" is ignored per UPnP DA 1.1.
+    let bad_man =
+        format!("M-SEARCH * HTTP/1.1\r\nHOST: {ssdp_addr}\r\nMX: 1\r\nST: {SSDP_ALL}\r\n\r\n");
+    sock.send_to(bad_man.as_bytes(), ssdp_addr).await.unwrap();
+    let mut buf = [0u8; 4096];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "M-SEARCH without MAN should receive no replies"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn gena_auto_renewal_keeps_short_lived_subscription_alive() {
+    let (_renderer, server) = start_test_server("Den", "RenewTest").await;
+    let device = OpenHomeDevice::connect(server.description_url())
+        .await
+        .unwrap();
+    let volume = device.volume().unwrap();
+
+    let listener = EventListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+
+    // 2-second timeout -> auto_renew_loop renews every 1s, leaving >1s headroom
+    // before the initial TTL elapses.
+    let subscribed_at = tokio::time::Instant::now();
+    let mut sub = listener
+        .subscribe_service(&device, SERVICE_VOLUME_1, 2)
+        .await
+        .unwrap();
+    let init = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(init.seq, 0);
+
+    // Wait just past the initial 2s TTL so the subscription can only still be active
+    // if the background renewal loop succeeded.
+    tokio::time::sleep_until(subscribed_at + Duration::from_millis(2200)).await;
+    assert_eq!(server.events().active_subscription_count(), 1);
+
+    volume.set_volume(88).await.unwrap();
+    let delta = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+        .await
+        .expect("subscription still alive after auto-renewal")
+        .unwrap();
+    assert_eq!(delta.seq, 1);
+    assert_eq!(
+        delta.properties.get("Volume").map(String::as_str),
+        Some("88")
+    );
+
+    sub.unsubscribe().await.unwrap();
+    listener.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn topology_matrix_url_base_and_product_v2_interop() {
+    // Empty topology -> 0 rooms.
+    let empty = Topology::from_devices(&[]).await.unwrap();
+    assert_eq!(empty.room_count(), 0);
+
+    // Two devices in the SAME room: one full renderer, one Product-only preamp in standby.
+    let (_r1, s1) = start_test_server("Cinema", "Streamer").await;
+    let minimal = Arc::new(MinimalProduct {
+        room: "Cinema".into(),
+        name: "Preamp".into(),
+    });
+    let s2 = OpenHomeServer::builder(minimal)
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .ssdp(SsdpConfig::disabled())
+        .start()
+        .await
+        .unwrap();
+
+    let d1 = OpenHomeDevice::connect(s1.description_url()).await.unwrap();
+    let d2 = OpenHomeDevice::connect(s2.description_url()).await.unwrap();
+
+    let topo = Topology::from_devices(&[d1.clone(), d2]).await.unwrap();
+    assert_eq!(topo.room_count(), 1);
+    let cinema = topo.room("Cinema").unwrap();
+    assert_eq!(cinema.devices.len(), 2);
+    assert_eq!(topo.senders().count(), 1);
+    assert_eq!(topo.receivers().count(), 1);
+    assert!(cinema.devices.iter().any(|d| d.standby));
+    assert!(cinema.devices.iter().any(|d| !d.standby));
+
+    // Product:2 client talking to our Product:1 server works seamlessly (same action set).
+    let product_v2 = ProductClient::with_service_type(
+        HttpClient::default(),
+        format!("http://{}/ctl/Product", s1.local_addr()),
+        SERVICE_PRODUCT_2.to_string(),
+    );
+    assert_eq!(product_v2.product().await.unwrap().room, "Cinema");
+
+    // URLBase resolution: DeviceDescription with URLBase resolves relative controlURL.
+    let desc_with_url_base = DeviceDescription {
+        url_base: Some(format!("http://{}/", s1.local_addr())),
+        device_type: DEVICE_SOURCE_1.into(),
+        friendly_name: "URLBase Dev".into(),
+        manufacturer: "Test".into(),
+        manufacturer_url: None,
+        model_description: None,
+        model_name: "Test".into(),
+        model_number: None,
+        model_url: None,
+        serial_number: None,
+        udn: s1.udn().into(),
+        presentation_url: None,
+        services: vec![ServiceDescription {
+            service_type: SERVICE_PRODUCT_1.into(),
+            service_id: openhome_core::urn::SERVICE_ID_PRODUCT.into(),
+            scpd_url: "scpd/Product.xml".into(),
+            control_url: "ctl/Product".into(),
+            event_sub_url: "evt/Product".into(),
+        }],
+    };
+    let dev_url_base = OpenHomeDevice::from_description(
+        "http://unreachable-placeholder:1/description.xml",
+        desc_with_url_base,
+        HttpClient::default(),
+    );
+    assert_eq!(
+        dev_url_base
+            .product()
+            .unwrap()
+            .product()
+            .await
+            .unwrap()
+            .room,
+        "Cinema"
+    );
+
+    s1.shutdown().await;
+    s2.shutdown().await;
 }

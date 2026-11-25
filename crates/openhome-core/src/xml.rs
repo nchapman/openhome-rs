@@ -234,8 +234,12 @@ pub fn format_id_list(ids: &[u32]) -> String {
 /// Encode a UPnP device description document (`description.xml`).
 pub fn encode_device_description(desc: &DeviceDescription) -> String {
     let mut out = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><root xmlns="{UPNP_DEVICE_NS}"><specVersion><major>1</major><minor>0</minor></specVersion><device>"#
+        r#"<?xml version="1.0" encoding="utf-8"?><root xmlns="{UPNP_DEVICE_NS}"><specVersion><major>1</major><minor>0</minor></specVersion>"#
     );
+    if let Some(base) = &desc.url_base {
+        push_tag(&mut out, "URLBase", base);
+    }
+    out.push_str("<device>");
     push_tag(&mut out, "deviceType", &desc.device_type);
     push_tag(&mut out, "friendlyName", &desc.friendly_name);
     push_tag(&mut out, "manufacturer", &desc.manufacturer);
@@ -290,8 +294,10 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
 
     let mut device_depth = 0usize;
     let mut in_service = false;
+    let mut in_url_base = false;
     let mut current_tag: Option<String> = None;
 
+    let mut url_base: Option<String> = None;
     let mut device_type = String::new();
     let mut friendly_name = String::new();
     let mut manufacturer = String::new();
@@ -317,6 +323,8 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 if tag == "device" {
                     device_depth += 1;
+                } else if device_depth == 0 && tag == "URLBase" {
+                    in_url_base = true;
                 } else if device_depth == 1 {
                     if tag == "service" {
                         in_service = true;
@@ -329,6 +337,14 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
                         current_tag = Some(tag);
                     }
                 }
+            }
+            Ok(Event::Text(e)) if in_url_base => {
+                let text = e.unescape().map_err(|err| Error::Xml(err.to_string()))?;
+                url_base.get_or_insert_default().push_str(&text);
+            }
+            Ok(Event::CData(e)) if in_url_base => {
+                let text = String::from_utf8_lossy(e.as_ref());
+                url_base.get_or_insert_default().push_str(&text);
             }
             Ok(Event::Text(e)) if device_depth == 1 => {
                 if let Some(tag) = current_tag.as_deref() {
@@ -404,7 +420,9 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
             }
             Ok(Event::End(e)) => {
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                if tag == "device" {
+                if tag == "URLBase" && in_url_base {
+                    in_url_base = false;
+                } else if tag == "device" {
                     device_depth = device_depth.saturating_sub(1);
                     if device_depth == 0 {
                         break;
@@ -412,11 +430,11 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
                 } else if device_depth == 1 {
                     if tag == "service" && in_service {
                         services.push(ServiceDescription {
-                            service_type: std::mem::take(&mut svc_type),
-                            service_id: std::mem::take(&mut svc_id),
-                            scpd_url: std::mem::take(&mut scpd_url),
-                            control_url: std::mem::take(&mut control_url),
-                            event_sub_url: std::mem::take(&mut event_sub_url),
+                            service_type: std::mem::take(&mut svc_type).trim().to_string(),
+                            service_id: std::mem::take(&mut svc_id).trim().to_string(),
+                            scpd_url: std::mem::take(&mut scpd_url).trim().to_string(),
+                            control_url: std::mem::take(&mut control_url).trim().to_string(),
+                            event_sub_url: std::mem::take(&mut event_sub_url).trim().to_string(),
                         });
                         in_service = false;
                         current_tag = None;
@@ -431,6 +449,12 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
         }
     }
 
+    let device_type = device_type.trim().to_string();
+    let udn = udn.trim().to_string();
+    let url_base = url_base
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     if udn.is_empty() || device_type.is_empty() {
         return Err(Error::Xml(
             "device description missing required deviceType or UDN".into(),
@@ -438,17 +462,18 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
     }
 
     Ok(DeviceDescription {
+        url_base,
         device_type,
-        friendly_name,
-        manufacturer,
-        manufacturer_url,
-        model_description,
-        model_name,
-        model_number,
-        model_url,
-        serial_number,
+        friendly_name: friendly_name.trim().to_string(),
+        manufacturer: manufacturer.trim().to_string(),
+        manufacturer_url: manufacturer_url.map(|s| s.trim().to_string()),
+        model_description: model_description.map(|s| s.trim().to_string()),
+        model_name: model_name.trim().to_string(),
+        model_number: model_number.map(|s| s.trim().to_string()),
+        model_url: model_url.map(|s| s.trim().to_string()),
+        serial_number: serial_number.map(|s| s.trim().to_string()),
         udn,
-        presentation_url,
+        presentation_url: presentation_url.map(|s| s.trim().to_string()),
         services,
     })
 }
@@ -497,6 +522,7 @@ mod tests {
     #[test]
     fn device_description_roundtrip() {
         let desc = DeviceDescription {
+            url_base: None,
             device_type: crate::urn::DEVICE_SOURCE_1.into(),
             friendly_name: "Living Room & Den".into(),
             manufacturer: "OpenHome RS".into(),
@@ -518,5 +544,70 @@ mod tests {
         };
         let xml = encode_device_description(&desc);
         assert_eq!(decode_device_description(&xml).unwrap(), desc);
+    }
+
+    #[test]
+    fn device_description_with_url_base_and_pretty_whitespace() {
+        let xml = r#"<?xml version="1.0"?>
+        <root xmlns="urn:schemas-upnp-org:device-1-0">
+          <URLBase> http://192.168.1.9:8080/oh/ </URLBase>
+          <device>
+            <deviceType>
+              urn:av-openhome-org:device:Source:1
+            </deviceType>
+            <friendlyName> Studio </friendlyName>
+            <manufacturer> Linn </manufacturer>
+            <modelName> DS </modelName>
+            <UDN> uuid:abc-123 </UDN>
+            <serviceList>
+              <service>
+                <serviceType> urn:av-openhome-org:service:Product:2 </serviceType>
+                <serviceId> urn:av-openhome-org:serviceId:Product </serviceId>
+                <SCPDURL> scpd/Product.xml </SCPDURL>
+                <controlURL> ctl/Product </controlURL>
+                <eventSubURL> evt/Product </eventSubURL>
+              </service>
+            </serviceList>
+          </device>
+        </root>"#;
+
+        let desc = decode_device_description(xml).unwrap();
+        assert_eq!(
+            desc.url_base.as_deref(),
+            Some("http://192.168.1.9:8080/oh/")
+        );
+        assert_eq!(desc.device_type, crate::urn::DEVICE_SOURCE_1);
+        assert_eq!(desc.udn, "uuid:abc-123");
+        assert_eq!(desc.services[0].service_type, crate::urn::SERVICE_PRODUCT_2);
+        assert_eq!(desc.services[0].control_url, "ctl/Product");
+    }
+
+    #[test]
+    fn xml_edge_and_error_cases() {
+        // Missing UDN fails cleanly.
+        assert!(
+            decode_device_description("<root><device><deviceType>x</deviceType></device></root>")
+                .is_err()
+        );
+
+        // SourceXml missing SystemName falls back to Name; Visible accepts 0/1; CDATA works.
+        let src_xml = "<SourceList><Source><Name><![CDATA[Line In]]></Name><Type>Analog</Type><Visible>0</Visible></Source></SourceList>";
+        let srcs = decode_source_xml(src_xml).unwrap();
+        assert_eq!(srcs.len(), 1);
+        assert_eq!(srcs[0].name, "Line In");
+        assert_eq!(srcs[0].system_name, "Line In");
+        assert!(!srcs[0].visible);
+        assert_eq!(srcs[0].source_type, SourceType::Analog);
+
+        // TrackList invalid numeric Id errors cleanly; CDATA preserved.
+        assert!(decode_track_list("<TrackList><Entry><Id>abc</Id></Entry></TrackList>").is_err());
+        let tl = decode_track_list("<TrackList><Entry><Id>7</Id><Uri><![CDATA[http://a/b&c]]></Uri><Metadata><![CDATA[<DIDL/>]]></Metadata></Entry></TrackList>").unwrap();
+        assert_eq!(tl[0].id, 7);
+        assert_eq!(tl[0].uri, "http://a/b&c");
+        assert_eq!(tl[0].metadata, "<DIDL/>");
+
+        // parse_id_list handles empty, all-invalid, and overflow.
+        assert!(parse_id_list("   ").is_empty());
+        assert!(parse_id_list("-1 abc 999999999999999999999").is_empty());
     }
 }

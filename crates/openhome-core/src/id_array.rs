@@ -127,5 +127,16 @@ mod tests {
     fn rejects_non_multiple_of_4_bytes() {
         // "AA==" decodes to 1 byte, not a valid u32 array
         assert!(decode_id_array("AA==").is_err());
+        // Odd length
+        assert!(decode_id_array("AAA").is_err());
+        // Invalid base64 char
+        assert!(decode_id_array("AAA!").is_err());
+        // Misplaced padding
+        assert!(decode_id_array("AA=A").is_err());
+        assert!(decode_id_array("AA==AAAA").is_err());
+        // Whitespace inside base64 is tolerated
+        let enc = encode_id_array(&[1, 2]);
+        let spaced = format!("  {} \n {} ", &enc[..4], &enc[4..]);
+        assert_eq!(decode_id_array(&spaced).unwrap(), vec![1, 2]);
     }
 }

@@ -156,6 +156,7 @@ impl OpenHomeServerBuilder {
         });
 
         let description = DeviceDescription {
+            url_base: None,
             device_type: DEVICE_SOURCE_1.to_string(),
             friendly_name,
             manufacturer: if pinfo.manufacturer_name.is_empty() {

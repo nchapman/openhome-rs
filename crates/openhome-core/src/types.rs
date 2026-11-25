@@ -62,6 +62,7 @@ pub struct ServiceDescription {
 /// UPnP device descriptor (`description.xml`) for `urn:av-openhome-org:device:Source:1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDescription {
+    pub url_base: Option<String>,
     pub device_type: String,
     pub friendly_name: String,
     pub manufacturer: String,
@@ -121,7 +122,7 @@ impl SourceType {
     }
 
     pub fn parse(s: &str) -> Self {
-        match s {
+        match s.trim() {
             "Playlist" => Self::Playlist,
             "Radio" => Self::Radio,
             "Receiver" => Self::Receiver,
@@ -271,7 +272,7 @@ impl TransportState {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
+        match s.trim() {
             "Stopped" => Some(Self::Stopped),
             "Playing" => Some(Self::Playing),
             "Paused" => Some(Self::Paused),
@@ -377,7 +378,7 @@ impl ReceiverState {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
+        match s.trim() {
             "Stopped" => Some(Self::Stopped),
             "Playing" => Some(Self::Playing),
             "Waiting" => Some(Self::Waiting),
@@ -406,11 +407,61 @@ impl SenderStatus {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
+        match s.trim() {
             "Disabled" => Some(Self::Disabled),
             "Enabled" => Some(Self::Enabled),
             "Blocked" => Some(Self::Blocked),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upnp_bool_format_and_parse() {
+        assert_eq!(format_upnp_bool(true), "1");
+        assert_eq!(format_upnp_bool(false), "0");
+        for truthy in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(parse_upnp_bool("Flag", truthy).unwrap());
+        }
+        for falsy in ["0", "false", "FALSE", "no", " No "] {
+            assert!(!parse_upnp_bool("Flag", falsy).unwrap());
+        }
+        assert!(parse_upnp_bool("Flag", "maybe").is_err());
+    }
+
+    #[test]
+    fn enums_and_attributes_parsing() {
+        assert_eq!(SourceType::parse(" Playlist "), SourceType::Playlist);
+        assert_eq!(
+            SourceType::parse("CustomSrc"),
+            SourceType::Other("CustomSrc".into())
+        );
+
+        let attrs = DeviceAttributes::parse("Info Volume UnknownToken Receiver");
+        assert!(attrs.info && attrs.volume && attrs.receiver);
+        assert!(!attrs.time && !attrs.sender && !attrs.credentials);
+        assert_eq!(attrs.to_attribute_string(), "Info Volume Receiver");
+
+        assert_eq!(
+            TransportState::parse(" Playing "),
+            Some(TransportState::Playing)
+        );
+        assert_eq!(TransportState::parse("Bogus"), None);
+
+        assert_eq!(
+            ReceiverState::parse(" Waiting\n"),
+            Some(ReceiverState::Waiting)
+        );
+        assert_eq!(ReceiverState::parse("Unknown"), None);
+
+        assert_eq!(
+            SenderStatus::parse(" Blocked "),
+            Some(SenderStatus::Blocked)
+        );
+        assert_eq!(SenderStatus::parse("Unknown"), None);
     }
 }

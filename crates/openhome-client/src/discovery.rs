@@ -27,6 +27,11 @@ pub struct DiscoveryOptions {
     pub target_addr: SocketAddrV4,
     /// Local UDP bind address for sending `M-SEARCH` and receiving unicast replies.
     pub bind_addr: SocketAddrV4,
+    /// Optional IPv4 multicast outbound interface for multi-homed hosts.
+    pub interface: Option<Ipv4Addr>,
+    /// When `true` (default), filter out non-OpenHome UPnP devices (such as
+    /// UPnP AV `MediaRenderer:1` devices coexisting on the same LAN).
+    pub openhome_only: bool,
     /// Number of `M-SEARCH` packets to transmit (default `2` for UDP resilience).
     pub send_count: usize,
     /// HTTP client used to fetch each discovered device's `description.xml`.
@@ -41,6 +46,8 @@ impl Default for DiscoveryOptions {
             timeout: Duration::from_secs(3),
             target_addr: SSDP_ADDR_V4,
             bind_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            interface: None,
+            openhome_only: true,
             send_count: 2,
             http: HttpClient::default(),
         }
@@ -72,6 +79,9 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
     if options.target_addr.ip().is_multicast() {
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(2);
+        if let Some(iface) = options.interface {
+            let _ = sock.set_multicast_if_v4(&iface);
+        }
     }
     sock.set_nonblocking(true)?;
 
@@ -111,6 +121,9 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
     let mut seen_udns = HashSet::new();
     for location in locations {
         if let Ok(dev) = OpenHomeDevice::connect_with_http(&location, options.http.clone()).await {
+            if options.openhome_only && !dev.is_openhome_device() {
+                continue;
+            }
             let desc = dev.description().clone();
             if seen_udns.insert(desc.udn.clone()) {
                 devices.push(DiscoveredDevice {

@@ -388,3 +388,175 @@ fn parse_http_url(url: &str) -> Option<(String, String)> {
     };
     Some((host_port, path.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Response, StatusCode};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn callback_validation_and_limits() {
+        let local4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mapped_local4 = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let local6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        assert!(is_allowed_callback(
+            "http://127.0.0.1:8080/cb",
+            Some(local4)
+        ));
+        assert!(is_allowed_callback(
+            "http://127.0.0.1:8080/cb",
+            Some(mapped_local4)
+        ));
+        assert!(is_allowed_callback("http://[::1]:8080/cb", Some(local6)));
+
+        // Reject mismatches, hostnames, https, port 0, and unspecified IPs.
+        assert!(!is_allowed_callback(
+            "http://169.254.169.254:80/latest",
+            Some(local4)
+        ));
+        assert!(!is_allowed_callback(
+            "http://localhost:8080/cb",
+            Some(local4)
+        ));
+        assert!(!is_allowed_callback(
+            "https://127.0.0.1:8080/cb",
+            Some(local4)
+        ));
+        assert!(!is_allowed_callback("http://127.0.0.1:0/cb", Some(local4)));
+        assert!(!is_allowed_callback("http://0.0.0.0:8080/cb", None));
+    }
+
+    #[tokio::test]
+    async fn event_hub_limits_service_scoping_and_retry_preserves_state() {
+        let hub = EventHub::new();
+
+        // Bind a mock callback server that fails the first NOTIFY with 500, then succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
+
+        let attempts_srv = attempts.clone();
+        let srv_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempts_c = attempts_srv.clone();
+                let tx_c = tx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let attempts_c = attempts_c.clone();
+                        let tx_c = tx_c.clone();
+                        async move {
+                            let n = attempts_c.fetch_add(1, Ordering::SeqCst);
+                            let seq = req
+                                .headers()
+                                .get("seq")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(999);
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let body_str = String::from_utf8_lossy(&body).into_owned();
+                            if n == 0 {
+                                // Fail initial attempt transiently.
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                )
+                            } else {
+                                let _ = tx_c.send((seq, body_str));
+                                Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap())
+                            }
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        let mut initial = BTreeMap::new();
+        initial.insert("Volume".into(), "40".into());
+
+        let (sid, timeout) = hub
+            .subscribe(
+                "Volume",
+                vec![format!("http://{cb_addr}/cb")],
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some(999_999), // clamped to MAX_TIMEOUT_SECS
+                initial,
+            )
+            .unwrap();
+        assert_eq!(timeout, MAX_TIMEOUT_SECS);
+
+        // Wrong service slug cannot renew or unsubscribe.
+        assert!(hub.renew("Playlist", &sid, Some(60)).is_none());
+        assert!(!hub.unsubscribe("Playlist", &sid));
+        assert_eq!(hub.renew("Volume", &sid, Some(60)), Some(60));
+
+        // Await retry delivery of SEQ=0 via channel (no fixed sleep).
+        let (seq0, body0) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("retry delivered SEQ=0 in time")
+            .expect("channel open");
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(seq0, 0);
+        assert!(body0.contains("<Volume>40</Volume>"));
+
+        // Now send a state update and confirm SEQ=1 arrives promptly.
+        let mut updated = BTreeMap::new();
+        updated.insert("Volume".into(), "55".into());
+        hub.notify_snapshot("Volume", &updated);
+        let (seq1, body1) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("delta delivered SEQ=1 in time")
+            .expect("channel open");
+        assert_eq!(seq1, 1);
+        assert!(body1.contains("<Volume>55</Volume>"));
+
+        assert!(hub.unsubscribe("Volume", &sid));
+        assert_eq!(hub.active_subscription_count(), 0);
+        srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn event_hub_enforces_max_subscriptions() {
+        let hub = EventHub::new();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            hub.subscribe(
+                "Product",
+                vec!["http://127.0.0.1:9/cb".into()],
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some(60),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        let err = hub
+            .subscribe(
+                "Product",
+                vec!["http://127.0.0.1:9/cb".into()],
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some(60),
+                BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err, SubscribeError::TooManySubscriptions);
+        hub.clear();
+    }
+}

@@ -146,7 +146,7 @@ pub fn decode_ssdp_packet(packet: &[u8]) -> Result<SsdpMessage, Error> {
         field: "ssdp",
         value: e.to_string(),
     })?;
-    let mut lines = text.split("\r\n");
+    let mut lines = text.lines();
     let first_line = lines
         .next()
         .ok_or_else(|| Error::InvalidValue {
@@ -318,5 +318,34 @@ mod tests {
         assert!(search_target_matches(SSDP_ALL, DEVICE_SOURCE_1));
         assert!(search_target_matches(DEVICE_SOURCE_1, DEVICE_SOURCE_1));
         assert!(!search_target_matches("upnp:rootdevice", DEVICE_SOURCE_1));
+    }
+
+    #[test]
+    fn ssdp_handles_lf_only_lowercase_headers_and_rejects_malformed() {
+        let lf_packet = "HTTP/1.1 200 OK\n\
+                         cache-control: public, MAX-AGE = 90\n\
+                         location: http://10.0.0.5:8080/desc.xml\n\
+                         st: urn:av-openhome-org:device:Source:1\n\
+                         usn: uuid:999::urn:av-openhome-org:device:Source:1\n\n";
+        let msg = decode_ssdp_packet(lf_packet.as_bytes()).unwrap();
+        assert_eq!(
+            msg,
+            SsdpMessage::Response(SsdpResponse {
+                st: DEVICE_SOURCE_1.into(),
+                usn: "uuid:999::urn:av-openhome-org:device:Source:1".into(),
+                location: "http://10.0.0.5:8080/desc.xml".into(),
+                server: None,
+                max_age: Some(90),
+            })
+        );
+
+        assert!(decode_ssdp_packet(b"").is_err());
+        assert!(decode_ssdp_packet(&[0xff, 0xfe]).is_err());
+        assert!(decode_ssdp_packet(b"BOGUS * HTTP/1.1\r\n\r\n").is_err());
+        assert!(decode_ssdp_packet(b"M-SEARCH * HTTP/1.1\r\n\r\n").is_err());
+        assert!(
+            decode_ssdp_packet(b"NOTIFY * HTTP/1.1\r\nNT: x\r\nNTS: ssdp:weird\r\nUSN: u\r\n\r\n")
+                .is_err()
+        );
     }
 }

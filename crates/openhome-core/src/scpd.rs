@@ -93,6 +93,14 @@ mod tests {
                 expected_count,
                 "unexpected action count for {urn}: {actions:?}"
             );
+            // Every action must have an explicit <argumentList> element.
+            let arg_list_count = xml.matches("<argumentList>").count();
+            assert_eq!(
+                arg_list_count, expected_count,
+                "missing <argumentList> in {urn}"
+            );
         }
+
+        assert!(scpd_for_service_type("urn:unknown:service:Foo:1").is_none());
     }
 }

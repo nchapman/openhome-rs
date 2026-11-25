@@ -922,3 +922,112 @@ pub fn sender_snapshot(svc: &dyn SenderService) -> BTreeMap<String, String> {
     map.insert("Attributes".into(), svc.attributes());
     map
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryRenderer;
+    use openhome_core::soap::encode_action_request;
+
+    fn product_only_registry() -> ServiceRegistry {
+        let renderer = Arc::new(MemoryRenderer::new("Room", "Name"));
+        ServiceRegistry {
+            product: renderer,
+            playlist: None,
+            info: None,
+            time: None,
+            volume: None,
+            receiver: None,
+            sender: None,
+        }
+    }
+
+    #[test]
+    fn partial_registry_reports_only_registered_services() {
+        let reg = product_only_registry();
+        assert!(reg.has_service(SLUG_PRODUCT));
+        assert!(!reg.has_service(SLUG_PLAYLIST));
+        assert!(!reg.has_service(SLUG_VOLUME));
+        assert_eq!(reg.service_descriptions().len(), 1);
+        assert!(reg.scpd_xml(SLUG_PRODUCT).is_some());
+        assert!(reg.scpd_xml(SLUG_PLAYLIST).is_none());
+        assert!(reg.state_snapshot(SLUG_PRODUCT).is_some());
+        assert!(reg.state_snapshot(SLUG_PLAYLIST).is_none());
+
+        let req = encode_action_request(SERVICE_PLAYLIST_1, "Play", &[]);
+        let err = reg
+            .dispatch_soap(SLUG_PLAYLIST, None, &req)
+            .err()
+            .expect("unregistered service returns fault");
+        assert_eq!(err.code, Fault::INVALID_ACTION);
+    }
+
+    #[test]
+    fn dispatch_soap_error_paths_and_header_precedence() {
+        let renderer = Arc::new(MemoryRenderer::new("Room", "Name"));
+        let reg = ServiceRegistry {
+            product: renderer.clone(),
+            playlist: Some(renderer.clone()),
+            info: None,
+            time: None,
+            volume: Some(renderer),
+            receiver: None,
+            sender: None,
+        };
+
+        // Malformed XML -> 402 Invalid Args.
+        let err = reg
+            .dispatch_soap(SLUG_PRODUCT, None, "<not-soap/>")
+            .err()
+            .unwrap();
+        assert_eq!(err.code, Fault::INVALID_ARGS);
+
+        // Missing required argument -> 402.
+        let missing_arg = encode_action_request(SERVICE_VOLUME_1, "SetVolume", &[]);
+        let err = reg
+            .dispatch_soap(SLUG_VOLUME, None, &missing_arg)
+            .err()
+            .unwrap();
+        assert_eq!(err.code, Fault::INVALID_ARGS);
+
+        // Non-numeric ui4 / bad bool -> 402.
+        let bad_u32 = encode_action_request(SERVICE_VOLUME_1, "SetVolume", &[("Value", "abc")]);
+        assert_eq!(
+            reg.dispatch_soap(SLUG_VOLUME, None, &bad_u32)
+                .err()
+                .unwrap()
+                .code,
+            Fault::INVALID_ARGS
+        );
+        let bad_bool = encode_action_request(SERVICE_VOLUME_1, "SetMute", &[("Value", "maybe")]);
+        assert_eq!(
+            reg.dispatch_soap(SLUG_VOLUME, None, &bad_bool)
+                .err()
+                .unwrap()
+                .code,
+            Fault::INVALID_ARGS
+        );
+
+        // Unknown action -> 401.
+        let unknown = encode_action_request(SERVICE_PRODUCT_1, "BogusAction", &[]);
+        assert_eq!(
+            reg.dispatch_soap(SLUG_PRODUCT, None, &unknown)
+                .err()
+                .unwrap()
+                .code,
+            Fault::INVALID_ACTION
+        );
+
+        // SOAPACTION header takes precedence over body action element name.
+        let body = encode_action_request(SERVICE_PRODUCT_1, "IgnoredBodyName", &[]);
+        let out = reg
+            .dispatch_soap(
+                SLUG_PRODUCT,
+                Some("\"urn:av-openhome-org:service:Product:1#Standby\""),
+                &body,
+            )
+            .unwrap();
+        assert!(out.response_xml.contains("StandbyResponse"));
+        assert!(!out.mutated);
+    }
+}

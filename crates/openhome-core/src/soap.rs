@@ -262,5 +262,31 @@ mod tests {
             Some(("urn:av-openhome-org:service:Volume:1", "SetVolume"))
         );
         assert_eq!(parse_soapaction_header("no-hash"), None);
+        assert_eq!(parse_soapaction_header("#Play"), None);
+        assert_eq!(parse_soapaction_header("urn:svc#"), None);
+    }
+
+    #[test]
+    fn soap_edge_and_error_cases() {
+        // Missing Body/action errors cleanly.
+        assert!(decode_soap_args("<s:Envelope><s:Body/></s:Envelope>").is_err());
+
+        // Self-closing empty arg & CDATA arg.
+        let req = r#"<s:Envelope><s:Body><u:Insert><AfterId>0</AfterId><Uri><![CDATA[http://x/a&b]]></Uri><Metadata/></u:Insert></s:Body></s:Envelope>"#;
+        let (act, args) = decode_soap_args(req).unwrap();
+        assert_eq!(act, "Insert");
+        assert_eq!(args.get("Uri").map(String::as_str), Some("http://x/a&b"));
+        assert_eq!(args.get("Metadata").map(String::as_str), Some(""));
+
+        // Non-fault response returns Ok(None).
+        assert_eq!(decode_soap_fault(req).unwrap(), None);
+
+        // Pretty-printed fault trims description; missing errorCode falls back to ACTION_FAILED.
+        let fault_xml = r#"<s:Envelope><s:Body><s:Fault><faultstring>
+          Custom Fault
+        </faultstring></s:Fault></s:Body></s:Envelope>"#;
+        let f = decode_soap_fault(fault_xml).unwrap().unwrap();
+        assert_eq!(f.code, Fault::ACTION_FAILED);
+        assert_eq!(f.description, "Custom Fault");
     }
 }

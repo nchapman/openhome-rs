@@ -150,6 +150,14 @@ impl SsdpRunner {
                 recv = self.socket.recv_from(&mut buf) => {
                     if let Ok((len, peer)) = recv
                         && let Ok(SsdpMessage::MSearch(search)) = decode_ssdp_packet(&buf[..len])
+                        && search.man.as_deref().is_some_and(|m| {
+                            m.split(';')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .trim_matches('"')
+                                .eq_ignore_ascii_case("ssdp:discover")
+                        })
                     {
                         self.handle_msearch(&search.st, peer).await;
                     }

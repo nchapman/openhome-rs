@@ -271,8 +271,13 @@ async fn auto_renew_loop(
     mut timeout_secs: u32,
     mut stop_rx: watch::Receiver<bool>,
 ) {
+    let mut consecutive_failures = 0u8;
     loop {
-        let sleep_secs = u64::from(timeout_secs / 2).max(1);
+        let sleep_secs = if consecutive_failures > 0 {
+            1
+        } else {
+            u64::from(timeout_secs / 2).max(1)
+        };
         tokio::select! {
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
@@ -283,8 +288,14 @@ async fn auto_renew_loop(
                 match http.gena_renew(&event_sub_url, &sid, timeout_secs).await {
                     Ok(granted) => {
                         timeout_secs = granted;
+                        consecutive_failures = 0;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -333,7 +344,9 @@ async fn handle_notify(req: Request<Incoming>, routes: RouteMap) -> Response<Ful
 
     let nt = header_str(&req, "nt");
     let nts = header_str(&req, "nts");
-    if nt != Some("upnp:event") || nts != Some("upnp:propchange") {
+    if !nt.is_some_and(|v| v.eq_ignore_ascii_case("upnp:event"))
+        || !nts.is_some_and(|v| v.eq_ignore_ascii_case("upnp:propchange"))
+    {
         return empty_status(StatusCode::PRECONDITION_FAILED);
     }
 
@@ -425,5 +438,120 @@ fn format_host(host: &str) -> String {
         format!("[{host}]")
     } else {
         host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    async fn send_raw_http(addr: SocketAddr, req: Request<Full<Bytes>>) -> StatusCode {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let resp = sender.send_request(req).await.unwrap();
+        resp.status()
+    }
+
+    #[tokio::test]
+    async fn callback_server_rejects_wrong_method_unknown_token_bad_headers_and_mismatched_sid() {
+        let listener = EventListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+
+        // Register a known route with an expected SID.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let token = "testtoken123".to_string();
+        listener.routes.write().unwrap().insert(
+            token.clone(),
+            RouteEntry {
+                tx,
+                expected_sid: Arc::new(RwLock::new(Some("uuid:expected-sid".into()))),
+            },
+        );
+
+        let body = r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><Volume>99</Volume></e:property></e:propertyset>"#;
+
+        // 1. Wrong HTTP method -> 405.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/cb/{token}"))
+            .header("HOST", addr.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req).await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        // 2. Unknown token -> 412.
+        let req = Request::builder()
+            .method("NOTIFY")
+            .uri("/cb/unknown-token")
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", "uuid:expected-sid")
+            .header("SEQ", "0")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        // 3. Forged / mismatched SID on valid token -> 412 and nothing delivered.
+        let req = Request::builder()
+            .method("NOTIFY")
+            .uri(format!("/cb/{token}"))
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", "uuid:attacker-sid")
+            .header("SEQ", "0")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        // 4. Bad SEQ -> 400.
+        let req = Request::builder()
+            .method("NOTIFY")
+            .uri(format!("/cb/{token}"))
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", "uuid:expected-sid")
+            .header("SEQ", "not-a-num")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        assert_eq!(send_raw_http(addr, req).await, StatusCode::BAD_REQUEST);
+
+        // 5. Case-insensitive NT/NTS with valid SID -> 200 OK and event delivered.
+        let req = Request::builder()
+            .method("NOTIFY")
+            .uri(format!("/cb/{token}"))
+            .header("HOST", addr.to_string())
+            .header("NT", "UPNP:EVENT")
+            .header("NTS", "UPNP:PROPCHANGE")
+            .header("SID", "uuid:expected-sid")
+            .header("SEQ", "0")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        assert_eq!(send_raw_http(addr, req).await, StatusCode::OK);
+
+        let ev = rx.try_recv().expect("valid NOTIFY delivered");
+        assert_eq!(ev.sid, "uuid:expected-sid");
+        assert_eq!(ev.properties.get("Volume").map(String::as_str), Some("99"));
+
+        listener.shutdown().await;
     }
 }

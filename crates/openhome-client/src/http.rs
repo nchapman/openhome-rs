@@ -337,5 +337,33 @@ mod tests {
             resolve_url(base, "http://10.0.0.1:8080/ctl").unwrap(),
             "http://10.0.0.1:8080/ctl"
         );
+        assert!(matches!(
+            resolve_url(base, "https://10.0.0.1/ctl"),
+            Err(ClientError::InvalidUrl(_))
+        ));
+
+        let no_path = ParsedUrl::parse("http://192.168.1.5").unwrap();
+        assert_eq!(no_path.connect_addr, "192.168.1.5:80");
+        assert_eq!(no_path.path_and_query, "/");
+
+        let ipv6 = ParsedUrl::parse("http://[::1]:8080/ctl?x=1").unwrap();
+        assert_eq!(ipv6.connect_addr, "[::1]:8080");
+        assert_eq!(ipv6.path_and_query, "/ctl?x=1");
+
+        let ipv6_default = ParsedUrl::parse("http://[::1]/desc.xml").unwrap();
+        assert_eq!(ipv6_default.connect_addr, "[::1]:80");
+
+        assert!(matches!(
+            ParsedUrl::parse("https://127.0.0.1:8080/x"),
+            Err(ClientError::InvalidUrl(_))
+        ));
+        assert!(matches!(
+            ParsedUrl::parse("http:///no-host"),
+            Err(ClientError::InvalidUrl(_))
+        ));
+        assert!(matches!(
+            ParsedUrl::parse("ftp://127.0.0.1/x"),
+            Err(ClientError::InvalidUrl(_))
+        ));
     }
 }
