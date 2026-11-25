@@ -1,26 +1,24 @@
 //! Async OpenHome Media control point client (`av.openhome.org`).
 //!
-//! Will provide SSDP discovery, device XML parsing, typed clients for
+//! Provides SSDP discovery, UPnP device XML parsing, typed clients for
 //! `Product`, `Playlist`, `Info`, `Time`, `Volume`, `Receiver`, and `Sender`,
-//! and GENA event subscriptions.
+//! a GENA event subscriber with automatic renewal, and a room/source topology model.
 
-use openhome_core::Error as CoreError;
-use thiserror::Error;
+pub mod device;
+pub mod discovery;
+pub mod error;
+pub mod gena;
+pub mod http;
+pub mod services;
+pub mod topology;
 
-/// Discovered OpenHome device summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredDevice {
-    pub udn: String,
-    pub friendly_name: String,
-    pub location: String,
-}
-
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error(transparent)]
-    Core(#[from] CoreError),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("HTTP error: {0}")]
-    Http(String),
-}
+pub use device::OpenHomeDevice;
+pub use discovery::{DiscoveredDevice, DiscoveryOptions, discover};
+pub use error::ClientError;
+pub use gena::{EventListener, EventSubscription, GenaEvent};
+pub use http::HttpClient;
+pub use services::{
+    InfoClient, PlaylistClient, ProductClient, ReceiverClient, SenderClient, TimeClient,
+    VolumeClient,
+};
+pub use topology::{RoomTopology, Topology, TopologyDevice};

@@ -19,6 +19,12 @@ impl Fault {
     pub const INVALID_ID: u16 = 800;
     /// OpenHome Playlist: playlist is at `TracksMax` capacity.
     pub const PLAYLIST_FULL: u16 = 801;
+    /// OpenHome Product: source not found.
+    pub const SOURCE_NOT_FOUND: u16 = 801;
+    /// OpenHome Playlist: index out of range.
+    pub const INVALID_INDEX: u16 = 802;
+    /// OpenHome Playlist: seek failed.
+    pub const SEEK_FAILED: u16 = 803;
 
     pub fn new(code: u16, description: impl Into<String>) -> Self {
         Self {
@@ -40,11 +46,23 @@ impl Fault {
     }
 
     pub fn invalid_id() -> Self {
-        Self::new(Self::INVALID_ID, "Invalid Id")
+        Self::new(Self::INVALID_ID, "Id not found")
     }
 
     pub fn playlist_full() -> Self {
-        Self::new(Self::PLAYLIST_FULL, "Playlist Full")
+        Self::new(Self::PLAYLIST_FULL, "Playlist full")
+    }
+
+    pub fn source_not_found() -> Self {
+        Self::new(Self::SOURCE_NOT_FOUND, "Source not found")
+    }
+
+    pub fn invalid_index() -> Self {
+        Self::new(Self::INVALID_INDEX, "Index not found")
+    }
+
+    pub fn seek_failed() -> Self {
+        Self::new(Self::SEEK_FAILED, "Seek failed")
     }
 
     pub fn action_failed(msg: impl Into<String>) -> Self {

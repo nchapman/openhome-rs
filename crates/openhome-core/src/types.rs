@@ -2,6 +2,95 @@
 
 use std::fmt;
 
+use crate::error::Error;
+
+/// Format a boolean using UPnP's canonical `"1"` / `"0"` lexical representation.
+pub fn format_upnp_bool(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+/// Parse a UPnP/OpenHome boolean value (`"1"`, `"0"`, `"true"`, `"false"`, `"yes"`, `"no"`).
+pub fn parse_upnp_bool(field: &'static str, value: &str) -> Result<bool, Error> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(Error::InvalidValue {
+            field,
+            value: value.to_string(),
+        }),
+    }
+}
+
+/// Manufacturer details returned by `Product.Manufacturer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManufacturerDetails {
+    pub name: String,
+    pub info: String,
+    pub url: String,
+    pub image_uri: String,
+}
+
+/// Model details returned by `Product.Model`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelDetails {
+    pub name: String,
+    pub info: String,
+    pub url: String,
+    pub image_uri: String,
+}
+
+/// Product details returned by `Product.Product`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductDetails {
+    pub room: String,
+    pub name: String,
+    pub info: String,
+    pub url: String,
+    pub image_uri: String,
+}
+
+/// UPnP service descriptor within `description.xml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDescription {
+    pub service_type: String,
+    pub service_id: String,
+    pub scpd_url: String,
+    pub control_url: String,
+    pub event_sub_url: String,
+}
+
+/// UPnP device descriptor (`description.xml`) for `urn:av-openhome-org:device:Source:1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDescription {
+    pub device_type: String,
+    pub friendly_name: String,
+    pub manufacturer: String,
+    pub manufacturer_url: Option<String>,
+    pub model_description: Option<String>,
+    pub model_name: String,
+    pub model_number: Option<String>,
+    pub model_url: Option<String>,
+    pub serial_number: Option<String>,
+    /// Canonical UDN, e.g. `"uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"`.
+    pub udn: String,
+    pub presentation_url: Option<String>,
+    pub services: Vec<ServiceDescription>,
+}
+
+impl DeviceDescription {
+    /// Find a service by its UPnP `serviceType` URN (e.g. `SERVICE_PLAYLIST_1`).
+    pub fn find_service(&self, service_type: &str) -> Option<&ServiceDescription> {
+        self.services
+            .iter()
+            .find(|s| s.service_type == service_type)
+    }
+
+    /// Find a service by its UPnP `serviceId` (e.g. `SERVICE_ID_PLAYLIST`).
+    pub fn find_service_by_id(&self, service_id: &str) -> Option<&ServiceDescription> {
+        self.services.iter().find(|s| s.service_id == service_id)
+    }
+}
+
 /// Source type reported in `Product.SourceXml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceType {
@@ -114,7 +203,7 @@ impl DeviceAttributes {
 }
 
 /// Product identity metadata returned by `Product.Manufacturer`, `Model`, and `Product`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProductInfo {
     pub manufacturer_name: String,
     pub manufacturer_info: String,
@@ -129,6 +218,36 @@ pub struct ProductInfo {
     pub product_info: String,
     pub product_url: String,
     pub product_image_uri: String,
+}
+
+impl ProductInfo {
+    pub fn manufacturer(&self) -> ManufacturerDetails {
+        ManufacturerDetails {
+            name: self.manufacturer_name.clone(),
+            info: self.manufacturer_info.clone(),
+            url: self.manufacturer_url.clone(),
+            image_uri: self.manufacturer_image_uri.clone(),
+        }
+    }
+
+    pub fn model(&self) -> ModelDetails {
+        ModelDetails {
+            name: self.model_name.clone(),
+            info: self.model_info.clone(),
+            url: self.model_url.clone(),
+            image_uri: self.model_image_uri.clone(),
+        }
+    }
+
+    pub fn product(&self) -> ProductDetails {
+        ProductDetails {
+            room: self.product_room.clone(),
+            name: self.product_name.clone(),
+            info: self.product_info.clone(),
+            url: self.product_url.clone(),
+            image_uri: self.product_image_uri.clone(),
+        }
+    }
 }
 
 /// `Playlist.TransportState` values.

@@ -27,6 +27,45 @@ pub fn encode_propertyset(props: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// Parse a GENA `CALLBACK` header containing one or more angle-bracketed URLs
+/// such as `<http://192.168.1.10:5000/callback>`.
+pub fn parse_callback_header(header: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = header;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('>') {
+            let url = rest[..end].trim();
+            // Per UPnP GENA 1.1, event callback URLs use HTTP.
+            if url.starts_with("http://") {
+                urls.push(url.to_string());
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    urls
+}
+
+/// Parse a GENA `TIMEOUT` header (e.g. `Second-1800`, `Second-infinite`) into seconds.
+/// Returns `None` if unparseable or `infinite`.
+pub fn parse_timeout_header(header: &str) -> Option<u32> {
+    let trimmed = header.trim();
+    let rest = trimmed
+        .strip_prefix("Second-")
+        .or_else(|| trimmed.strip_prefix("second-"))?;
+    if rest.eq_ignore_ascii_case("infinite") {
+        return None;
+    }
+    rest.parse::<u32>().ok().filter(|&s| s > 0)
+}
+
+/// Format a GENA `TIMEOUT` header value (`Second-<secs>`).
+pub fn format_timeout_header(secs: u32) -> String {
+    format!("Second-{secs}")
+}
+
 /// Decode an OpenHome GENA `<e:propertyset>` XML body into key/value pairs.
 pub fn decode_propertyset(xml: &str) -> Result<BTreeMap<String, String>, Error> {
     let mut reader = Reader::from_str(xml);
@@ -60,6 +99,14 @@ pub fn decode_propertyset(xml: &str) -> Result<BTreeMap<String, String>, Error> 
                     }
                 }
             }
+            Ok(Event::CData(e)) if current_var.is_some() => {
+                if let Some(var) = &current_var {
+                    let text = String::from_utf8_lossy(e.as_ref());
+                    if let Some(slot) = props.get_mut(var) {
+                        slot.push_str(&text);
+                    }
+                }
+            }
             Ok(Event::End(e)) => {
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 if current_var.as_deref() == Some(local.as_str()) {
@@ -88,5 +135,16 @@ mod tests {
         props.insert("IdArray".into(), "AAAAAQAAAAI=".into());
         let xml = encode_propertyset(&props);
         assert_eq!(decode_propertyset(&xml).unwrap(), props);
+    }
+
+    #[test]
+    fn callback_and_timeout_headers() {
+        assert_eq!(
+            parse_callback_header("<http://127.0.0.1:8080/evt><http://127.0.0.1:8081/evt>"),
+            vec!["http://127.0.0.1:8080/evt", "http://127.0.0.1:8081/evt"]
+        );
+        assert_eq!(parse_timeout_header("Second-1800"), Some(1800));
+        assert_eq!(parse_timeout_header("Second-infinite"), None);
+        assert_eq!(format_timeout_header(300), "Second-300");
     }
 }

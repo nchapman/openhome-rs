@@ -27,6 +27,11 @@ pub const SERVICE_ID_SENDER: &str = "urn:av-openhome-org:serviceId:Sender";
 pub const SERVICE_TRANSPORT_1: &str = "urn:av-openhome-org:service:Transport:1";
 pub const SERVICE_ID_TRANSPORT: &str = "urn:av-openhome-org:serviceId:Transport";
 
+pub const UPNP_DEVICE_NS: &str = "urn:schemas-upnp-org:device-1-0";
+pub const UPNP_SERVICE_NS: &str = "urn:schemas-upnp-org:service-1-0";
 pub const UPNP_EVENT_NS: &str = "urn:schemas-upnp-org:event-1-0";
 pub const SOAP_ENVELOPE_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 pub const UPNP_CONTROL_NS: &str = "urn:schemas-upnp-org:control-1-0";
+
+pub const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
+pub const SSDP_ALL: &str = "ssdp:all";

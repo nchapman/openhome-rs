@@ -54,6 +54,100 @@ pub fn encode_fault(fault: &Fault) -> String {
     )
 }
 
+/// Parse a `SOAPACTION` HTTP header value such as
+/// `"urn:av-openhome-org:service:Playlist:1#Play"` into `(service_urn, action)`.
+pub fn parse_soapaction_header(header: &str) -> Option<(&str, &str)> {
+    let trimmed = header.trim().trim_matches('"');
+    let (service, action) = trimmed.split_once('#')?;
+    if service.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some((service, action))
+}
+
+/// Decode a UPnP/OpenHome SOAP Fault from an XML envelope, if present.
+pub fn decode_soap_fault(xml: &str) -> Result<Option<Fault>, Error> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut in_fault = false;
+    let mut current_tag: Option<String> = None;
+    let mut error_code = String::new();
+    let mut error_desc = String::new();
+    let mut fault_string = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if local == "Fault" {
+                    in_fault = true;
+                } else if in_fault {
+                    current_tag = Some(local);
+                }
+            }
+            Ok(Event::Text(e)) if in_fault => {
+                if let Some(tag) = current_tag.as_deref() {
+                    let text = e.unescape().map_err(|err| Error::Xml(err.to_string()))?;
+                    match tag {
+                        "errorCode" => error_code.push_str(&text),
+                        "errorDescription" => error_desc.push_str(&text),
+                        "faultstring" => fault_string.push_str(&text),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::CData(e)) if in_fault => {
+                if let Some(tag) = current_tag.as_deref() {
+                    let text = String::from_utf8_lossy(e.as_ref());
+                    match tag {
+                        "errorCode" => error_code.push_str(&text),
+                        "errorDescription" => error_desc.push_str(&text),
+                        "faultstring" => fault_string.push_str(&text),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if current_tag.as_deref() == Some(local.as_str()) {
+                    current_tag = None;
+                } else if local == "Fault" {
+                    break;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(Error::Xml(err.to_string())),
+            _ => {}
+        }
+    }
+
+    if !in_fault {
+        return Ok(None);
+    }
+
+    let code = error_code
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(Fault::ACTION_FAILED);
+    let description = if !error_desc.trim().is_empty() {
+        error_desc.trim().to_string()
+    } else if !fault_string.trim().is_empty() {
+        fault_string.trim().to_string()
+    } else {
+        "UPnPError".to_string()
+    };
+    Ok(Some(Fault::new(code, description)))
+}
+
+/// Decode a SOAP action response envelope, returning `Err(Error::Fault(..))` if
+/// the envelope carries a UPnP SOAP Fault.
+pub fn decode_soap_response(xml: &str) -> Result<(String, HashMap<String, String>), Error> {
+    if let Some(fault) = decode_soap_fault(xml)? {
+        return Err(Error::Fault(fault));
+    }
+    decode_soap_args(xml)
+}
+
 /// Parse SOAP action arguments from the first child element inside `<s:Body>`.
 pub fn decode_soap_args(xml: &str) -> Result<(String, HashMap<String, String>), Error> {
     let mut reader = Reader::from_str(xml);
@@ -89,6 +183,14 @@ pub fn decode_soap_args(xml: &str) -> Result<(String, HashMap<String, String>), 
             Ok(Event::Text(e)) if depth_in_action == 1 => {
                 if let Some(arg) = &current_arg {
                     let text = e.unescape().map_err(|err| Error::Xml(err.to_string()))?;
+                    if let Some(slot) = args.get_mut(arg) {
+                        slot.push_str(&text);
+                    }
+                }
+            }
+            Ok(Event::CData(e)) if depth_in_action == 1 => {
+                if let Some(arg) = &current_arg {
+                    let text = String::from_utf8_lossy(e.as_ref());
                     if let Some(slot) = args.get_mut(arg) {
                         slot.push_str(&text);
                     }
@@ -142,5 +244,23 @@ mod tests {
             args.get("Metadata").map(String::as_str),
             Some("<DIDL-Lite/>")
         );
+    }
+
+    #[test]
+    fn soap_fault_roundtrip_and_soapaction_parse() {
+        let fault = Fault::invalid_id();
+        let xml = encode_fault(&fault);
+        assert_eq!(decode_soap_fault(&xml).unwrap(), Some(fault.clone()));
+        assert!(matches!(decode_soap_response(&xml), Err(Error::Fault(f)) if f == fault));
+
+        assert_eq!(
+            parse_soapaction_header("\"urn:av-openhome-org:service:Playlist:1#Insert\""),
+            Some(("urn:av-openhome-org:service:Playlist:1", "Insert"))
+        );
+        assert_eq!(
+            parse_soapaction_header("urn:av-openhome-org:service:Volume:1#SetVolume"),
+            Some(("urn:av-openhome-org:service:Volume:1", "SetVolume"))
+        );
+        assert_eq!(parse_soapaction_header("no-hash"), None);
     }
 }
