@@ -169,14 +169,22 @@ impl EventHub {
         }
     }
 
+    /// Returns `true` if at least one non-expired subscription exists for `service_slug`.
+    pub fn has_subscribers_for(&self, service_slug: &str) -> bool {
+        let now = Instant::now();
+        let map = self.subs.read().expect("EventHub lock poisoned");
+        map.values()
+            .any(|sub| sub.service_slug == service_slug && sub.expires_at > now)
+    }
+
     /// Update each active subscriber's latest state snapshot for `service_slug`
     /// and wake its delivery task so any unconfirmed changes are emitted.
     pub fn notify_snapshot(&self, service_slug: &str, current_state: &BTreeMap<String, String>) {
-        let mut map = self.subs.write().expect("EventHub lock poisoned");
-        prune_expired(&mut map);
+        let now = Instant::now();
+        let map = self.subs.read().expect("EventHub lock poisoned");
 
         for sub in map.values() {
-            if sub.service_slug != service_slug {
+            if sub.service_slug != service_slug || sub.expires_at <= now {
                 continue;
             }
             let should_wake = {
@@ -253,6 +261,8 @@ async fn delivery_loop(
     // Yield once so the SUBSCRIBE HTTP response can be flushed before SEQ=0.
     tokio::task::yield_now().await;
     let mut consecutive_failures: u32 = 0;
+    let mut cached_conn: Option<(String, hyper::client::conn::http1::SendRequest<Full<Bytes>>)> =
+        None;
 
     loop {
         if *cancel.borrow() {
@@ -286,10 +296,13 @@ async fn delivery_loop(
             }
         };
 
-        let body = encode_propertyset(&sent_props);
+        let body = Bytes::from(encode_propertyset(&sent_props));
         let mut delivered = false;
         for url in &callbacks {
-            if send_notify(url, &sid, seq, &body).await.is_ok() {
+            if send_notify(url, &sid, seq, body.clone(), &mut cached_conn)
+                .await
+                .is_ok()
+            {
                 delivered = true;
                 break;
             }
@@ -325,8 +338,27 @@ async fn delivery_loop(
     }
 }
 
-async fn send_notify(url: &str, sid: &str, seq: u32, body: &str) -> Result<(), ()> {
+async fn send_notify(
+    url: &str,
+    sid: &str,
+    seq: u32,
+    body_bytes: Bytes,
+    cached_conn: &mut Option<(String, hyper::client::conn::http1::SendRequest<Full<Bytes>>)>,
+) -> Result<(), ()> {
     let (host_port, path) = parse_http_url(url).ok_or(())?;
+
+    // Try reusing an existing keep-alive connection for the same host:port first.
+    if let Some((cached_host, mut sender)) = cached_conn.take()
+        && cached_host == host_port
+        && sender.is_ready()
+        && let Ok(keep_alive) =
+            send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes.clone()).await
+    {
+        if keep_alive && sender.is_ready() {
+            *cached_conn = Some((cached_host, sender));
+        }
+        return Ok(());
+    }
 
     let stream = tokio::time::timeout(NOTIFY_TIMEOUT, TcpStream::connect(&host_port))
         .await
@@ -344,18 +376,31 @@ async fn send_notify(url: &str, sid: &str, seq: u32, body: &str) -> Result<(), (
         let _ = conn.await;
     });
 
-    let body_bytes = Bytes::from(body.as_bytes().to_vec());
+    let keep_alive = send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes).await?;
+    if keep_alive && sender.is_ready() {
+        *cached_conn = Some((host_port, sender));
+    }
+    Ok(())
+}
+
+async fn send_notify_on(
+    sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    host_port: &str,
+    path: &str,
+    sid: &str,
+    seq: u32,
+    body_bytes: Bytes,
+) -> Result<bool, ()> {
     let req = Request::builder()
         .method("NOTIFY")
         .uri(path)
-        .header(HOST, &host_port)
+        .header(HOST, host_port)
         .header(CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
         .header(CONTENT_LENGTH, body_bytes.len().to_string())
         .header("NT", "upnp:event")
         .header("NTS", "upnp:propchange")
         .header("SID", sid)
         .header("SEQ", seq.to_string())
-        .header("CONNECTION", "close")
         .body(Full::new(body_bytes))
         .map_err(|_| ())?;
 
@@ -365,10 +410,19 @@ async fn send_notify(url: &str, sid: &str, seq: u32, body: &str) -> Result<(), (
         .map_err(|_| ())?;
 
     let status = resp.status();
+    let conn_close = resp
+        .headers()
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("close"));
     let limited = Limited::new(resp.into_body(), 64 * 1024);
     let _ = tokio::time::timeout(NOTIFY_TIMEOUT, limited.collect()).await;
 
-    if status.is_success() { Ok(()) } else { Err(()) }
+    if status.is_success() {
+        Ok(!conn_close)
+    } else {
+        Err(())
+    }
 }
 
 fn parse_http_url(url: &str) -> Option<(String, String)> {

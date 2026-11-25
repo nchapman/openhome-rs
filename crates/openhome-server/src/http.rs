@@ -25,7 +25,7 @@ const MAX_SOAP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
-    pub description_xml: Arc<String>,
+    pub description_xml: Bytes,
     pub registry: ServiceRegistry,
     pub events: EventHub,
     pub server_header: Arc<String>,
@@ -92,7 +92,7 @@ async fn handle_request(
             let body = if method == Method::HEAD {
                 Bytes::new()
             } else {
-                Bytes::from(state.description_xml.as_bytes().to_vec())
+                state.description_xml.clone()
             };
             return xml_response(
                 StatusCode::OK,
@@ -169,8 +169,8 @@ async fn handle_soap(
         .dispatch_soap(slug, soap_action.as_deref(), body_str)
     {
         Ok(output) => {
-            if output.mutated {
-                notify_all_services(&state.registry, &state.events);
+            if !output.mutated_services.is_empty() {
+                notify_services(&state.registry, &state.events, output.mutated_services);
             }
             let bytes = Bytes::from(output.response_xml);
             let len = bytes.len();
@@ -271,15 +271,20 @@ fn handle_unsubscribe(
     }
 }
 
-pub(crate) fn notify_all_services(registry: &ServiceRegistry, events: &EventHub) {
-    if events.active_subscription_count() == 0 {
-        return;
-    }
-    for slug in registry.registered_slugs() {
+pub(crate) fn notify_services(registry: &ServiceRegistry, events: &EventHub, slugs: &[&str]) {
+    for &slug in slugs {
+        if !events.has_subscribers_for(slug) {
+            continue;
+        }
         if let Some(snapshot) = registry.state_snapshot(slug) {
             events.notify_snapshot(slug, &snapshot);
         }
     }
+}
+
+pub(crate) fn notify_all_services(registry: &ServiceRegistry, events: &EventHub) {
+    let slugs = registry.registered_slugs();
+    notify_services(registry, events, &slugs);
 }
 
 fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {

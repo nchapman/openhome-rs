@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use openhome_core::DeviceDescription;
 use openhome_core::urn::DEVICE_SOURCE_1;
 use openhome_core::xml::encode_device_description;
@@ -178,7 +179,7 @@ impl OpenHomeServerBuilder {
             presentation_url: non_empty(&pinfo.product_url),
             services: registry.service_descriptions(),
         };
-        let description_xml = Arc::new(encode_device_description(&description));
+        let description_xml = Bytes::from(encode_device_description(&description));
 
         let listener = TcpListener::bind(self.bind_addr).await?;
         let local_addr = listener.local_addr()?;
@@ -273,6 +274,9 @@ impl OpenHomeServer {
 
     /// Push any changed state variables for a specific service slug to GENA subscribers.
     pub fn notify_service(&self, slug: &str) {
+        if !self.events.has_subscribers_for(slug) {
+            return;
+        }
         if let Some(snapshot) = self.registry.state_snapshot(slug) {
             self.events.notify_snapshot(slug, &snapshot);
         }

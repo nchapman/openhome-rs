@@ -25,6 +25,7 @@ use crate::error::ClientError;
 use crate::http::HttpClient;
 
 const MAX_NOTIFY_BODY_BYTES: usize = 4 * 1024 * 1024;
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// A decoded GENA `NOTIFY` event delivered by an OpenHome service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +37,7 @@ pub struct GenaEvent {
 
 #[derive(Clone)]
 struct RouteEntry {
-    tx: mpsc::UnboundedSender<GenaEvent>,
+    tx: mpsc::Sender<GenaEvent>,
     expected_sid: Arc<RwLock<Option<String>>>,
 }
 
@@ -100,7 +101,7 @@ impl EventListener {
         let event_sub_url = event_sub_url.into();
         // Unpredictable 128-bit token prevents LAN peers from guessing callback paths.
         let token = Uuid::new_v4().simple().to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let expected_sid = Arc::new(RwLock::new(None));
 
         // Register route BEFORE sending SUBSCRIBE so an immediate SEQ=0 NOTIFY
@@ -205,7 +206,7 @@ pub struct EventSubscription {
     token: String,
     http: HttpClient,
     routes: RouteMap,
-    rx: mpsc::UnboundedReceiver<GenaEvent>,
+    rx: mpsc::Receiver<GenaEvent>,
     renew_stop_tx: watch::Sender<bool>,
     renew_task: Option<JoinHandle<()>>,
     unsubscribed: bool,
@@ -389,19 +390,15 @@ async fn handle_notify(req: Request<Incoming>, routes: RouteMap) -> Response<Ful
         return empty_status(StatusCode::PRECONDITION_FAILED);
     }
 
-    if entry
-        .tx
-        .send(GenaEvent {
-            sid,
-            seq,
-            properties,
-        })
-        .is_err()
-    {
-        return empty_status(StatusCode::PRECONDITION_FAILED);
+    match entry.tx.try_send(GenaEvent {
+        sid,
+        seq,
+        properties,
+    }) {
+        Ok(()) => empty_status(StatusCode::OK),
+        Err(mpsc::error::TrySendError::Full(_)) => empty_status(StatusCode::SERVICE_UNAVAILABLE),
+        Err(mpsc::error::TrySendError::Closed(_)) => empty_status(StatusCode::PRECONDITION_FAILED),
     }
-
-    empty_status(StatusCode::OK)
 }
 
 fn header_str<'a>(req: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
@@ -466,7 +463,7 @@ mod tests {
         let addr = listener.local_addr();
 
         // Register a known route with an expected SID.
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let token = "testtoken123".to_string();
         listener.routes.write().unwrap().insert(
             token.clone(),
@@ -551,6 +548,44 @@ mod tests {
         let ev = rx.try_recv().expect("valid NOTIFY delivered");
         assert_eq!(ev.sid, "uuid:expected-sid");
         assert_eq!(ev.properties.get("Volume").map(String::as_str), Some("99"));
+
+        // Bounded channel backpressure: full -> 503, closed -> 412.
+        let (full_tx, full_rx) = mpsc::channel(1);
+        full_tx
+            .try_send(GenaEvent {
+                sid: "uuid:full".into(),
+                seq: 0,
+                properties: BTreeMap::new(),
+            })
+            .unwrap();
+        listener.routes.write().unwrap().insert(
+            "full".into(),
+            RouteEntry {
+                tx: full_tx,
+                expected_sid: Arc::new(RwLock::new(Some("uuid:full".into()))),
+            },
+        );
+        let mk_full_req = || {
+            Request::builder()
+                .method("NOTIFY")
+                .uri("/cb/full")
+                .header("HOST", addr.to_string())
+                .header("NT", "upnp:event")
+                .header("NTS", "upnp:propchange")
+                .header("SID", "uuid:full")
+                .header("SEQ", "1")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap()
+        };
+        assert_eq!(
+            send_raw_http(addr, mk_full_req()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(full_rx);
+        assert_eq!(
+            send_raw_http(addr, mk_full_req()).await,
+            StatusCode::PRECONDITION_FAILED
+        );
 
         listener.shutdown().await;
     }

@@ -43,6 +43,8 @@ pub struct ServiceRegistry {
 pub struct DispatchOutput {
     pub response_xml: String,
     pub mutated: bool,
+    /// Service slugs whose GENA state may have changed (empty when `!mutated`).
+    pub mutated_services: &'static [&'static str],
 }
 
 impl ServiceRegistry {
@@ -203,7 +205,7 @@ impl ServiceRegistry {
             .map(|(_, a)| a)
             .unwrap_or(body_action.as_str());
 
-        match slug {
+        let mut out = match slug {
             SLUG_PRODUCT => dispatch_product(self.product.as_ref(), action, &args),
             SLUG_PLAYLIST => {
                 let svc = self
@@ -248,7 +250,24 @@ impl ServiceRegistry {
                 dispatch_sender(svc, action)
             }
             _ => Err(Fault::invalid_action(action)),
+        }?;
+        if out.mutated {
+            out.mutated_services = affected_slugs(slug);
         }
+        Ok(out)
+    }
+}
+
+fn affected_slugs(slug: &str) -> &'static [&'static str] {
+    match slug {
+        SLUG_VOLUME => &[SLUG_VOLUME],
+        SLUG_PRODUCT => &[SLUG_PRODUCT, SLUG_INFO],
+        SLUG_PLAYLIST => &[SLUG_PLAYLIST, SLUG_INFO, SLUG_TIME],
+        SLUG_RECEIVER => &[SLUG_RECEIVER, SLUG_INFO, SLUG_TIME],
+        SLUG_INFO => &[SLUG_INFO],
+        SLUG_TIME => &[SLUG_TIME],
+        SLUG_SENDER => &[SLUG_SENDER],
+        _ => &[],
     }
 }
 
@@ -296,6 +315,7 @@ fn ok_resp(
     Ok(DispatchOutput {
         response_xml: encode_action_response(urn, action, out),
         mutated,
+        mutated_services: &[],
     })
 }
 
@@ -970,7 +990,7 @@ mod tests {
             playlist: Some(renderer.clone()),
             info: None,
             time: None,
-            volume: Some(renderer),
+            volume: Some(renderer.clone()),
             receiver: None,
             sender: None,
         };
@@ -1029,5 +1049,57 @@ mod tests {
             .unwrap();
         assert!(out.response_xml.contains("StandbyResponse"));
         assert!(!out.mutated);
+        assert!(out.mutated_services.is_empty());
+
+        // Scoped GENA notification targets for mutating actions across services.
+        let vol_mut = reg
+            .dispatch_soap(
+                SLUG_VOLUME,
+                None,
+                &encode_action_request(SERVICE_VOLUME_1, "SetVolume", &[("Value", "25")]),
+            )
+            .unwrap();
+        assert!(vol_mut.mutated);
+        assert_eq!(vol_mut.mutated_services, &[SLUG_VOLUME]);
+
+        let prod_mut = reg
+            .dispatch_soap(
+                SLUG_PRODUCT,
+                None,
+                &encode_action_request(SERVICE_PRODUCT_1, "SetStandby", &[("Value", "1")]),
+            )
+            .unwrap();
+        assert!(prod_mut.mutated);
+        assert_eq!(prod_mut.mutated_services, &[SLUG_PRODUCT, SLUG_INFO]);
+
+        let pl_mut = reg
+            .dispatch_soap(
+                SLUG_PLAYLIST,
+                None,
+                &encode_action_request(SERVICE_PLAYLIST_1, "SetRepeat", &[("Value", "1")]),
+            )
+            .unwrap();
+        assert!(pl_mut.mutated);
+        assert_eq!(
+            pl_mut.mutated_services,
+            &[SLUG_PLAYLIST, SLUG_INFO, SLUG_TIME]
+        );
+
+        let full = ServiceRegistry {
+            receiver: Some(renderer.clone()),
+            ..reg
+        };
+        let rx_mut = full
+            .dispatch_soap(
+                SLUG_RECEIVER,
+                None,
+                &encode_action_request(SERVICE_RECEIVER_1, "Stop", &[]),
+            )
+            .unwrap();
+        assert!(rx_mut.mutated);
+        assert_eq!(
+            rx_mut.mutated_services,
+            &[SLUG_RECEIVER, SLUG_INFO, SLUG_TIME]
+        );
     }
 }

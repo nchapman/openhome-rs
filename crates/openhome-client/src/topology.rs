@@ -5,11 +5,16 @@
 //! Songcast Sender/Receiver capabilities.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use openhome_core::{DeviceAttributes, Source};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::device::OpenHomeDevice;
 use crate::error::ClientError;
+
+const MAX_CONCURRENT_DEVICES: usize = 16;
 
 /// Snapshot of a single OpenHome device within a room topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,38 +59,61 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// Query `Product:1` metadata on every device in `devices` and group them by room.
+    /// Query `Product:1` metadata on every device in `devices` concurrently and group them by room.
     pub async fn from_devices(devices: &[OpenHomeDevice]) -> Result<Self, ClientError> {
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DEVICES));
+        let mut set = JoinSet::new();
+
+        for (idx, dev) in devices.iter().cloned().enumerate() {
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ClientError::Http("topology semaphore closed".into()))?;
+                let product = dev.product()?;
+                let (details, standby, sources, source_index, attributes) = tokio::try_join!(
+                    product.product(),
+                    product.standby(),
+                    product.source_xml(),
+                    product.source_index(),
+                    product.attributes(),
+                )?;
+
+                let room_name = if details.room.is_empty() {
+                    dev.friendly_name().to_string()
+                } else {
+                    details.room.clone()
+                };
+
+                Ok::<_, ClientError>((
+                    idx,
+                    TopologyDevice {
+                        udn: dev.udn().to_string(),
+                        location: dev.location().to_string(),
+                        friendly_name: dev.friendly_name().to_string(),
+                        room: room_name,
+                        product_name: details.name,
+                        standby,
+                        sources,
+                        source_index,
+                        attributes,
+                    },
+                ))
+            });
+        }
+
+        let mut entries = Vec::with_capacity(devices.len());
+        while let Some(res) = set.join_next().await {
+            let item = res.map_err(|e| ClientError::Http(e.to_string()))??;
+            entries.push(item);
+        }
+        // Preserve caller-provided ordering within each room.
+        entries.sort_by_key(|(idx, _)| *idx);
+
         let mut rooms: BTreeMap<String, RoomTopology> = BTreeMap::new();
-
-        for dev in devices {
-            let product = dev.product()?;
-            let (details, standby, sources, source_index, attributes) = tokio::try_join!(
-                product.product(),
-                product.standby(),
-                product.source_xml(),
-                product.source_index(),
-                product.attributes(),
-            )?;
-
-            let room_name = if details.room.is_empty() {
-                dev.friendly_name().to_string()
-            } else {
-                details.room.clone()
-            };
-
-            let entry = TopologyDevice {
-                udn: dev.udn().to_string(),
-                location: dev.location().to_string(),
-                friendly_name: dev.friendly_name().to_string(),
-                room: room_name.clone(),
-                product_name: details.name,
-                standby,
-                sources,
-                source_index,
-                attributes,
-            };
-
+        for (_, entry) in entries {
+            let room_name = entry.room.clone();
             rooms
                 .entry(room_name.clone())
                 .or_insert_with(|| RoomTopology {

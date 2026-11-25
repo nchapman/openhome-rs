@@ -101,8 +101,8 @@ struct SenderState {
     receivers: HashMap<SocketAddrV4, Instant>,
     /// Primary receiver in unicast mode (receives `Slave` list + stream).
     primary: Option<SocketAddrV4>,
-    /// Bounded history of sent audio frames for `OhmMessage::Resend`.
-    history: VecDeque<OhmAudio>,
+    /// Bounded history of pre-encoded wire packets (with `RESENT` flag pre-set) for `OhmMessage::Resend`.
+    history: VecDeque<(u32, Vec<u8>)>,
     max_history: usize,
     latency_ms: u32,
     receiver_expiry: Duration,
@@ -132,19 +132,22 @@ impl SenderState {
             .collect()
     }
 
-    fn record_history(&mut self, mut audio: OhmAudio) {
-        audio.flags = audio.flags.with_resent();
+    fn record_history(&mut self, frame: u32, mut wire: Vec<u8>) {
+        // Flip the RESENT flag bit in-place so resends transmit the cached wire bytes directly.
+        if let Some(flags_byte) = wire.get_mut(crate::ohm::OHM_HEADER_BYTES + 1) {
+            *flags_byte |= AudioFlags::RESENT;
+        }
         if self.history.len() >= self.max_history {
             self.history.pop_front();
         }
-        self.history.push_back(audio);
+        self.history.push_back((frame, wire));
     }
 
-    fn lookup_history(&self, frames: &[u32]) -> Vec<OhmAudio> {
+    fn lookup_history(&self, frames: &[u32]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for &req in frames {
-            if let Some(found) = self.history.iter().find(|a| a.frame == req) {
-                out.push(found.clone());
+            if let Some((_, wire)) = self.history.iter().find(|(f, _)| *f == req) {
+                out.push(wire.clone());
             }
         }
         out
@@ -313,7 +316,7 @@ impl SongcastSender {
             (usize::from(format.bit_depth) / 8).max(1) * usize::from(format.channels).max(1);
         let samples = (pcm_be.len() / bytes_per_sample_frame).min(usize::from(u16::MAX)) as u16;
 
-        let (audio, targets) = {
+        let (frame_no, maybe_audio, targets) = {
             let mut st = self.state.lock().unwrap();
             let now = Instant::now();
             st.prune_expired(now);
@@ -322,51 +325,49 @@ impl SongcastSender {
             let frame = st.frame;
             let sample_start = st.sample_start;
             st.sample_start = st.sample_start.wrapping_add(u64::from(samples));
-            if !targets.is_empty() {
+            if targets.is_empty() {
                 // Per ohSongcast OhmSenderDriver::SendAudio, frame only advances when actively sending.
+                (frame, None, targets)
+            } else {
                 st.frame = st.frame.wrapping_add(1);
-            }
 
-            let mut flags = AudioFlags::TIMESTAMPED;
-            if format.lossless {
-                flags |= AudioFlags::LOSSLESS;
-            }
-            if halt {
-                flags |= AudioFlags::HALT;
-            }
+                let mut flags = AudioFlags::TIMESTAMPED;
+                if format.lossless {
+                    flags |= AudioFlags::LOSSLESS;
+                }
+                if halt {
+                    flags |= AudioFlags::HALT;
+                }
 
-            let network_timestamp =
-                duration_to_ticks(now.saturating_duration_since(st.epoch), format.sample_rate);
-            let media_latency = latency_ms_to_ticks(st.latency_ms, format.sample_rate);
+                let network_timestamp =
+                    duration_to_ticks(now.saturating_duration_since(st.epoch), format.sample_rate);
+                let media_latency = latency_ms_to_ticks(st.latency_ms, format.sample_rate);
 
-            let audio = OhmAudio {
-                flags: AudioFlags(flags),
-                samples,
-                frame,
-                network_timestamp,
-                media_latency,
-                media_timestamp: 0,
-                sample_start,
-                samples_total: format.samples_total,
-                sample_rate: format.sample_rate,
-                bit_rate: format.bit_rate,
-                volume_offset: format.volume_offset,
-                bit_depth: format.bit_depth,
-                channels: format.channels,
-                codec: format.codec.clone(),
-                audio: pcm_be,
-            };
-
-            if !targets.is_empty() {
-                st.record_history(audio.clone());
+                let audio = OhmAudio {
+                    flags: AudioFlags(flags),
+                    samples,
+                    frame,
+                    network_timestamp,
+                    media_latency,
+                    media_timestamp: 0,
+                    sample_start,
+                    samples_total: format.samples_total,
+                    sample_rate: format.sample_rate,
+                    bit_rate: format.bit_rate,
+                    volume_offset: format.volume_offset,
+                    bit_depth: format.bit_depth,
+                    channels: format.channels,
+                    codec: format.codec.clone(),
+                    audio: pcm_be,
+                };
+                (frame, Some(audio), targets)
             }
-            (audio, targets)
         };
 
-        let frame_no = audio.frame;
-        if !targets.is_empty() {
+        if let Some(audio) = maybe_audio {
             let bytes = OhmMessage::Audio(audio).encode()?;
             self.send_to_targets(&bytes, &targets).await?;
+            self.state.lock().unwrap().record_history(frame_no, bytes);
         }
         Ok(frame_no)
     }
@@ -492,10 +493,8 @@ async fn handle_incoming_control(
                 st.lookup_history(&frames)
             };
             let dest = multicast_dest.unwrap_or(peer);
-            for audio in to_resend {
-                if let Ok(bytes) = OhmMessage::Audio(audio).encode() {
-                    let _ = socket.send_to(&bytes, SocketAddr::V4(dest)).await;
-                }
+            for bytes in to_resend {
+                let _ = socket.send_to(&bytes, SocketAddr::V4(dest)).await;
             }
         }
         _ => {}

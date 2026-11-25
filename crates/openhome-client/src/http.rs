@@ -1,40 +1,49 @@
 //! HTTP/1.1 transport for UPnP descriptions, SOAP actions, and GENA control.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use openhome_core::Error as CoreError;
 use openhome_core::gena::{format_timeout_header, parse_timeout_header};
 use openhome_core::soap::{decode_soap_fault, decode_soap_response, encode_action_request};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crate::error::ClientError;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IDLE_CONNS_PER_HOST: usize = 4;
+const MAX_POOLED_HOSTS: usize = 32;
 
-/// Lightweight HTTP/1.1 client for OpenHome UPnP requests.
+type ConnPool = Arc<Mutex<HashMap<String, Vec<SendRequest<Full<Bytes>>>>>>;
+
+/// Lightweight HTTP/1.1 client with keep-alive connection pooling for OpenHome UPnP requests.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     timeout: Duration,
+    pool: ConnPool,
 }
 
 impl Default for HttpClient {
     fn default() -> Self {
-        Self {
-            timeout: DEFAULT_TIMEOUT,
-        }
+        Self::new(DEFAULT_TIMEOUT)
     }
 }
 
 impl HttpClient {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            pool: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -44,15 +53,16 @@ impl HttpClient {
     /// Perform an HTTP `GET` and return the UTF-8 response body.
     pub async fn get_text(&self, url: &str) -> Result<String, ClientError> {
         let parsed = ParsedUrl::parse(url)?;
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(&parsed.path_and_query)
-            .header(HOST, &parsed.host_header)
-            .header("CONNECTION", "close")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-
-        let (status, _headers, body) = self.send(&parsed.connect_addr, req).await?;
+        let (status, _headers, body) = self
+            .send_with_retry(&parsed.connect_addr, || {
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&parsed.path_and_query)
+                    .header(HOST, &parsed.host_header)
+                    .body(Full::new(Bytes::new()))
+                    .map_err(|e| ClientError::Http(e.to_string()))
+            })
+            .await?;
         if !status.is_success() {
             return Err(ClientError::HttpStatus(status.as_u16(), url.to_string()));
         }
@@ -72,18 +82,19 @@ impl HttpClient {
         let payload = Bytes::from(envelope.into_bytes());
         let soap_action = format!("\"{service_urn}#{action}\"");
 
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(&parsed.path_and_query)
-            .header(HOST, &parsed.host_header)
-            .header(CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
-            .header(CONTENT_LENGTH, payload.len().to_string())
-            .header("SOAPACTION", soap_action)
-            .header("CONNECTION", "close")
-            .body(Full::new(payload))
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-
-        let (status, _headers, body) = self.send(&parsed.connect_addr, req).await?;
+        let (status, _headers, body) = self
+            .send_with_retry(&parsed.connect_addr, || {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&parsed.path_and_query)
+                    .header(HOST, &parsed.host_header)
+                    .header(CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
+                    .header(CONTENT_LENGTH, payload.len().to_string())
+                    .header("SOAPACTION", &soap_action)
+                    .body(Full::new(payload.clone()))
+                    .map_err(|e| ClientError::Http(e.to_string()))
+            })
+            .await?;
         let body_str =
             String::from_utf8(body.to_vec()).map_err(|e| ClientError::Http(e.to_string()))?;
 
@@ -114,18 +125,21 @@ impl HttpClient {
         timeout_secs: u32,
     ) -> Result<(String, u32), ClientError> {
         let parsed = ParsedUrl::parse(event_sub_url)?;
-        let req = Request::builder()
-            .method("SUBSCRIBE")
-            .uri(&parsed.path_and_query)
-            .header(HOST, &parsed.host_header)
-            .header("CALLBACK", format!("<{callback_url}>"))
-            .header("NT", "upnp:event")
-            .header("TIMEOUT", format_timeout_header(timeout_secs))
-            .header("CONNECTION", "close")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-
-        let (status, headers, _body) = self.send(&parsed.connect_addr, req).await?;
+        let callback_header = format!("<{callback_url}>");
+        let timeout_header = format_timeout_header(timeout_secs);
+        let (status, headers, _body) = self
+            .send_with_retry(&parsed.connect_addr, || {
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(&parsed.path_and_query)
+                    .header(HOST, &parsed.host_header)
+                    .header("CALLBACK", &callback_header)
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", &timeout_header)
+                    .body(Full::new(Bytes::new()))
+                    .map_err(|e| ClientError::Http(e.to_string()))
+            })
+            .await?;
         if !status.is_success() {
             return Err(ClientError::SubscriptionFailed(format!(
                 "HTTP {} from {event_sub_url}",
@@ -158,17 +172,19 @@ impl HttpClient {
         timeout_secs: u32,
     ) -> Result<u32, ClientError> {
         let parsed = ParsedUrl::parse(event_sub_url)?;
-        let req = Request::builder()
-            .method("SUBSCRIBE")
-            .uri(&parsed.path_and_query)
-            .header(HOST, &parsed.host_header)
-            .header("SID", sid)
-            .header("TIMEOUT", format_timeout_header(timeout_secs))
-            .header("CONNECTION", "close")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-
-        let (status, headers, _body) = self.send(&parsed.connect_addr, req).await?;
+        let timeout_header = format_timeout_header(timeout_secs);
+        let (status, headers, _body) = self
+            .send_with_retry(&parsed.connect_addr, || {
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(&parsed.path_and_query)
+                    .header(HOST, &parsed.host_header)
+                    .header("SID", sid)
+                    .header("TIMEOUT", &timeout_header)
+                    .body(Full::new(Bytes::new()))
+                    .map_err(|e| ClientError::Http(e.to_string()))
+            })
+            .await?;
         if !status.is_success() {
             return Err(ClientError::SubscriptionFailed(format!(
                 "renew failed with HTTP {}",
@@ -190,16 +206,17 @@ impl HttpClient {
         sid: &str,
     ) -> Result<(), ClientError> {
         let parsed = ParsedUrl::parse(event_sub_url)?;
-        let req = Request::builder()
-            .method("UNSUBSCRIBE")
-            .uri(&parsed.path_and_query)
-            .header(HOST, &parsed.host_header)
-            .header("SID", sid)
-            .header("CONNECTION", "close")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| ClientError::Http(e.to_string()))?;
-
-        let (status, _headers, _body) = self.send(&parsed.connect_addr, req).await?;
+        let (status, _headers, _body) = self
+            .send_with_retry(&parsed.connect_addr, || {
+                Request::builder()
+                    .method("UNSUBSCRIBE")
+                    .uri(&parsed.path_and_query)
+                    .header(HOST, &parsed.host_header)
+                    .header("SID", sid)
+                    .body(Full::new(Bytes::new()))
+                    .map_err(|e| ClientError::Http(e.to_string()))
+            })
+            .await?;
         if !status.is_success() {
             return Err(ClientError::SubscriptionFailed(format!(
                 "unsubscribe failed with HTTP {}",
@@ -209,17 +226,38 @@ impl HttpClient {
         Ok(())
     }
 
-    async fn send(
-        &self,
-        connect_addr: &str,
-        req: Request<Full<Bytes>>,
-    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes), ClientError> {
+    async fn take_pooled(&self, connect_addr: &str) -> Option<SendRequest<Full<Bytes>>> {
+        let mut pool = self.pool.lock().await;
+        let conns = pool.get_mut(connect_addr)?;
+        while let Some(sender) = conns.pop() {
+            if sender.is_ready() {
+                return Some(sender);
+            }
+        }
+        None
+    }
+
+    async fn return_pooled(&self, connect_addr: &str, sender: SendRequest<Full<Bytes>>) {
+        if !sender.is_ready() {
+            return;
+        }
+        let mut pool = self.pool.lock().await;
+        if !pool.contains_key(connect_addr) && pool.len() >= MAX_POOLED_HOSTS {
+            return;
+        }
+        let conns = pool.entry(connect_addr.to_string()).or_default();
+        if conns.len() < MAX_IDLE_CONNS_PER_HOST {
+            conns.push(sender);
+        }
+    }
+
+    async fn connect(&self, connect_addr: &str) -> Result<SendRequest<Full<Bytes>>, ClientError> {
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(connect_addr))
             .await
             .map_err(|_| ClientError::Http(format!("connect timeout to {connect_addr}")))??;
 
         let io = TokioIo::new(stream);
-        let (mut sender, conn) =
+        let (sender, conn) =
             tokio::time::timeout(self.timeout, hyper::client::conn::http1::handshake(io))
                 .await
                 .map_err(|_| ClientError::Http("HTTP handshake timeout".into()))?
@@ -229,20 +267,82 @@ impl HttpClient {
             let _ = conn.await;
         });
 
+        Ok(sender)
+    }
+
+    async fn send_on(
+        &self,
+        connect_addr: &str,
+        mut sender: SendRequest<Full<Bytes>>,
+        req: Request<Full<Bytes>>,
+    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes), SendOnError> {
         let resp = tokio::time::timeout(self.timeout, sender.send_request(req))
             .await
-            .map_err(|_| ClientError::Http("HTTP request timeout".into()))?
-            .map_err(|e| ClientError::Http(e.to_string()))?;
+            .map_err(|_| SendOnError::Fatal(ClientError::Http("HTTP request timeout".into())))?
+            .map_err(|e| {
+                // Only treat pre-response closed/reset pooled sockets as safely retryable.
+                if e.is_closed() || e.is_canceled() || e.is_incomplete_message() {
+                    SendOnError::StalePool(ClientError::Http(e.to_string()))
+                } else {
+                    SendOnError::Fatal(ClientError::Http(e.to_string()))
+                }
+            })?;
 
         let status = resp.status();
         let headers = resp.headers().clone();
+        let conn_close = headers
+            .get(CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
         let limited = Limited::new(resp.into_body(), MAX_RESPONSE_BODY_BYTES);
         let collected = tokio::time::timeout(self.timeout, limited.collect())
             .await
-            .map_err(|_| ClientError::Http("HTTP body read timeout".into()))?
-            .map_err(|e| ClientError::Http(e.to_string()))?;
+            .map_err(|_| SendOnError::Fatal(ClientError::Http("HTTP body read timeout".into())))?
+            .map_err(|e| SendOnError::Fatal(ClientError::Http(e.to_string())))?;
+
+        if !conn_close {
+            self.return_pooled(connect_addr, sender).await;
+        }
 
         Ok((status, headers, collected.to_bytes()))
+    }
+
+    async fn send_with_retry<F>(
+        &self,
+        connect_addr: &str,
+        build_req: F,
+    ) -> Result<(StatusCode, hyper::HeaderMap, Bytes), ClientError>
+    where
+        F: Fn() -> Result<Request<Full<Bytes>>, ClientError>,
+    {
+        // Try a pooled keep-alive connection first; retry on a fresh socket ONLY if
+        // the idle connection was closed/reset before receiving a response.
+        if let Some(sender) = self.take_pooled(connect_addr).await {
+            let req = build_req()?;
+            match self.send_on(connect_addr, sender, req).await {
+                Ok(res) => return Ok(res),
+                Err(SendOnError::StalePool(_)) => {}
+                Err(SendOnError::Fatal(err)) => return Err(err),
+            }
+        }
+        let sender = self.connect(connect_addr).await?;
+        let req = build_req()?;
+        self.send_on(connect_addr, sender, req)
+            .await
+            .map_err(SendOnError::into_client_error)
+    }
+}
+
+enum SendOnError {
+    StalePool(ClientError),
+    Fatal(ClientError),
+}
+
+impl SendOnError {
+    fn into_client_error(self) -> ClientError {
+        match self {
+            Self::StalePool(e) | Self::Fatal(e) => e,
+        }
     }
 }
 

@@ -242,6 +242,8 @@ pub(crate) fn bind_udp_v4(
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
     let _ = sock.set_reuse_port(true);
+    // Best-effort 1 MiB receive buffer to absorb jitter bursts before the reorder buffer.
+    let _ = sock.set_recv_buffer_size(1024 * 1024);
 
     if bind_addr.ip().is_multicast() {
         let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_addr.port());

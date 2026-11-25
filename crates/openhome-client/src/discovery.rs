@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openhome_core::DeviceDescription;
@@ -9,10 +10,14 @@ use openhome_core::ssdp::{SSDP_ADDR_V4, SsdpMessage, decode_ssdp_packet, encode_
 use openhome_core::urn::DEVICE_SOURCE_1;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::device::OpenHomeDevice;
 use crate::error::ClientError;
 use crate::http::HttpClient;
+
+const MAX_CONCURRENT_FETCHES: usize = 16;
 
 /// Options controlling SSDP `M-SEARCH` discovery.
 #[derive(Debug, Clone)]
@@ -117,22 +122,37 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
         }
     }
 
-    let mut devices = Vec::new();
-    let mut seen_udns = HashSet::new();
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let mut set = JoinSet::new();
     for location in locations {
-        if let Ok(dev) = OpenHomeDevice::connect_with_http(&location, options.http.clone()).await {
-            if options.openhome_only && !dev.is_openhome_device() {
-                continue;
+        let http = options.http.clone();
+        let openhome_only = options.openhome_only;
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok()?;
+            let dev = OpenHomeDevice::connect_with_http(&location, http)
+                .await
+                .ok()?;
+            if openhome_only && !dev.is_openhome_device() {
+                return None;
             }
             let desc = dev.description().clone();
-            if seen_udns.insert(desc.udn.clone()) {
-                devices.push(DiscoveredDevice {
-                    udn: desc.udn.clone(),
-                    friendly_name: desc.friendly_name.clone(),
-                    location,
-                    description: desc,
-                });
-            }
+            Some(DiscoveredDevice {
+                udn: desc.udn.clone(),
+                friendly_name: desc.friendly_name.clone(),
+                location,
+                description: desc,
+            })
+        });
+    }
+
+    let mut devices = Vec::new();
+    let mut seen_udns = HashSet::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(dev)) = res
+            && seen_udns.insert(dev.udn.clone())
+        {
+            devices.push(dev);
         }
     }
 
