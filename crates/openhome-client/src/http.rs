@@ -261,8 +261,13 @@ pub fn resolve_url(base_url: &str, rel_or_abs: &str) -> Result<String, ClientErr
     if rel_or_abs.starts_with('/') {
         Ok(format!("http://{}{}", parsed.host_header, rel_or_abs))
     } else {
-        let base_dir = match parsed.path_and_query.rfind('/') {
-            Some(idx) => &parsed.path_and_query[..=idx],
+        let base_path = parsed
+            .path_and_query
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("/");
+        let base_dir = match base_path.rfind('/') {
+            Some(idx) => &base_path[..=idx],
             None => "/",
         };
         Ok(format!(
@@ -361,9 +366,105 @@ mod tests {
             ParsedUrl::parse("http:///no-host"),
             Err(ClientError::InvalidUrl(_))
         ));
+        assert_eq!(
+            resolve_url("http://192.168.1.50:49152/upnp/desc.xml?v=2", "ctl/Product").unwrap(),
+            "http://192.168.1.50:49152/upnp/ctl/Product"
+        );
         assert!(matches!(
             ParsedUrl::parse("ftp://127.0.0.1/x"),
             Err(ClientError::InvalidUrl(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn http_client_handles_non_fault_500_missing_sid_infinite_timeout_and_renew_errors() {
+        use hyper::Response;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                        let resp = match req.uri().path() {
+                            "/soap500" => Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from_static(b"plain text error")))
+                                .unwrap(),
+                            "/soap404" => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Full::new(Bytes::from_static(b"not found")))
+                                .unwrap(),
+                            "/nosid" => Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                            "/infinite" => Response::builder()
+                                .status(StatusCode::OK)
+                                .header("SID", "uuid:inf-1")
+                                .header("TIMEOUT", "Second-infinite")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                            _ => Response::builder()
+                                .status(StatusCode::PRECONDITION_FAILED)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        };
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        let client = HttpClient::new(Duration::from_secs(2));
+        let base = format!("http://{addr}");
+
+        assert!(matches!(
+            client
+                .soap_call(&format!("{base}/soap500"), "urn:s", "Act", &[])
+                .await,
+            Err(ClientError::HttpStatus(500, _))
+        ));
+        assert!(matches!(
+            client
+                .soap_call(&format!("{base}/soap404"), "urn:s", "Act", &[])
+                .await,
+            Err(ClientError::HttpStatus(404, _))
+        ));
+        assert!(matches!(
+            client
+                .gena_subscribe(&format!("{base}/nosid"), "http://127.0.0.1:9/cb", 60)
+                .await,
+            Err(ClientError::SubscriptionFailed(_))
+        ));
+        let (sid, granted) = client
+            .gena_subscribe(&format!("{base}/infinite"), "http://127.0.0.1:9/cb", 120)
+            .await
+            .unwrap();
+        assert_eq!(sid, "uuid:inf-1");
+        assert_eq!(granted, 120);
+        assert!(matches!(
+            client
+                .gena_renew(&format!("{base}/fail"), "uuid:inf-1", 60)
+                .await,
+            Err(ClientError::SubscriptionFailed(_))
+        ));
+        assert!(matches!(
+            client
+                .gena_unsubscribe(&format!("{base}/fail"), "uuid:inf-1")
+                .await,
+            Err(ClientError::SubscriptionFailed(_))
+        ));
+
+        srv.abort();
     }
 }

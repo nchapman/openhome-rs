@@ -222,5 +222,13 @@ mod tests {
 
         buf.clear();
         assert!(!buf.has_gaps());
+
+        // Sequence wrap-around across u32::MAX -> 0 -> 1.
+        assert_eq!(
+            buf.push(mk_frame(u32::MAX - 1, false)),
+            PushOutcome::Ready(vec![mk_frame(u32::MAX - 1, false)])
+        );
+        assert_eq!(buf.push(mk_frame(1, false)), PushOutcome::GapDetected);
+        assert_eq!(buf.missing_frames(20), vec![u32::MAX, 0]);
     }
 }

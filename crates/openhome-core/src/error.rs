@@ -81,3 +81,22 @@ pub enum Error {
     #[error(transparent)]
     Fault(#[from] Fault),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fault_constructors_expose_spec_codes() {
+        assert_eq!(Fault::invalid_action("x").code, Fault::INVALID_ACTION);
+        assert_eq!(Fault::invalid_args("x").code, Fault::INVALID_ARGS);
+        assert_eq!(Fault::conflict("x").code, Fault::CONFLICT);
+        assert_eq!(Fault::invalid_id().code, Fault::INVALID_ID);
+        assert_eq!(Fault::playlist_full().code, Fault::PLAYLIST_FULL);
+        assert_eq!(Fault::source_not_found().code, Fault::SOURCE_NOT_FOUND);
+        assert_eq!(Fault::invalid_index().code, Fault::INVALID_INDEX);
+        assert_eq!(Fault::seek_failed().code, Fault::SEEK_FAILED);
+        assert_eq!(Fault::action_failed("x").code, Fault::ACTION_FAILED);
+        assert!(Fault::invalid_id().to_string().contains("800"));
+    }
+}

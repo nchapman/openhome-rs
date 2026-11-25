@@ -498,5 +498,24 @@ mod tests {
             assert_eq!(v.as_str(), s);
         }
         assert_eq!(SenderStatus::parse("Unknown"), None);
+
+        let empty_attrs = DeviceAttributes::default();
+        assert_eq!(empty_attrs.to_attribute_string(), "");
+
+        let info = ProductInfo {
+            manufacturer_name: "Mfg".into(),
+            model_name: "Mod".into(),
+            product_room: "Den".into(),
+            product_name: "Deck".into(),
+            ..ProductInfo::default()
+        };
+        assert_eq!(info.manufacturer().name, "Mfg");
+        assert_eq!(info.model().name, "Mod");
+        assert_eq!(info.product().room, "Den");
+
+        let vc = VolumeCharacteristics::default();
+        assert_eq!(vc.volume_max, 100);
+        assert_eq!(vc.balance_max, 0);
+        assert_eq!(vc.fade_max, 0);
     }
 }

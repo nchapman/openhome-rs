@@ -409,3 +409,70 @@ async fn unicast_primary_relays_to_slave_and_promotes_on_leave() {
     slave.shutdown().await;
     sender.shutdown().await;
 }
+
+#[tokio::test]
+async fn sender_freezes_frame_when_idle_and_evicts_old_resend_history() {
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        history_frames: 4,
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+    let fmt = AudioFormat::pcm(48_000, 16, 2);
+
+    // With 0 active receivers, frame stays frozen at 0 (matches ohSongcast).
+    assert_eq!(
+        sender.send_audio(&fmt, vec![0; 32], false).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        sender.send_audio(&fmt, vec![0; 32], false).await.unwrap(),
+        0
+    );
+
+    // Join a raw UDP peer, send 6 frames (history_frames=4 -> frames 0,1 evicted; 2..=5 kept).
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dest = SocketAddr::V4(sender.local_addr());
+    peer.send_to(&OhmMessage::Join.encode().unwrap(), dest)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sender.active_receivers() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for i in 0..6u32 {
+        assert_eq!(
+            sender
+                .send_audio(&fmt, vec![i as u8; 32], false)
+                .await
+                .unwrap(),
+            i
+        );
+    }
+
+    // Drain queued packets, then request Resend([0, 5]): only frame 5 (not evicted) is resent.
+    let mut buf = [0u8; 4096];
+    while tokio::time::timeout(Duration::from_millis(40), peer.recv_from(&mut buf))
+        .await
+        .is_ok()
+    {}
+
+    peer.send_to(&OhmMessage::Resend(vec![0, 5]).encode().unwrap(), dest)
+        .await
+        .unwrap();
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("resent frame 5 arrived")
+        .unwrap();
+    match OhmMessage::decode(&buf[..len]).unwrap() {
+        OhmMessage::Audio(a) => {
+            assert_eq!(a.frame, 5);
+            assert!(a.flags.is_resent());
+        }
+        other => panic!("expected resent Audio frame 5, got {other:?}"),
+    }
+
+    sender.shutdown().await;
+}

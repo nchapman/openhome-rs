@@ -318,10 +318,14 @@ impl SongcastSender {
             let now = Instant::now();
             st.prune_expired(now);
 
+            let targets = self.destinations(&st);
             let frame = st.frame;
-            st.frame = st.frame.wrapping_add(1);
             let sample_start = st.sample_start;
             st.sample_start = st.sample_start.wrapping_add(u64::from(samples));
+            if !targets.is_empty() {
+                // Per ohSongcast OhmSenderDriver::SendAudio, frame only advances when actively sending.
+                st.frame = st.frame.wrapping_add(1);
+            }
 
             let mut flags = AudioFlags::TIMESTAMPED;
             if format.lossless {
@@ -353,7 +357,6 @@ impl SongcastSender {
                 audio: pcm_be,
             };
 
-            let targets = self.destinations(&st);
             if !targets.is_empty() {
                 st.record_history(audio.clone());
             }
@@ -427,17 +430,31 @@ async fn handle_incoming_control(
                 (st.track.clone(), st.metatext.clone(), slave_update)
             };
 
-            let reply_dest = multicast_dest.unwrap_or(peer);
-            if let Ok(tb) = OhmMessage::Track(track).encode() {
-                let _ = socket.send_to(&tb, SocketAddr::V4(reply_dest)).await;
-            }
-            if let Ok(mb) = OhmMessage::Metatext(metatext).encode() {
-                let _ = socket.send_to(&mb, SocketAddr::V4(reply_dest)).await;
-            }
-            if let Some((primary, slaves)) = slave_update
-                && let Ok(sb) = OhmMessage::Slave(slaves).encode()
-            {
-                let _ = socket.send_to(&sb, SocketAddr::V4(primary)).await;
+            // Per ohSongcast/ohPipeline, unicast Join sends Slave list + Track/Metatext
+            // to primary (for relay to slaves) and a Listen to a newly joined slave.
+            if let Some((primary, slaves)) = slave_update {
+                if let Ok(sb) = OhmMessage::Slave(slaves).encode() {
+                    let _ = socket.send_to(&sb, SocketAddr::V4(primary)).await;
+                }
+                if let Ok(tb) = OhmMessage::Track(track).encode() {
+                    let _ = socket.send_to(&tb, SocketAddr::V4(primary)).await;
+                }
+                if let Ok(mb) = OhmMessage::Metatext(metatext).encode() {
+                    let _ = socket.send_to(&mb, SocketAddr::V4(primary)).await;
+                }
+                if peer != primary
+                    && let Ok(lb) = OhmMessage::Listen.encode()
+                {
+                    let _ = socket.send_to(&lb, SocketAddr::V4(peer)).await;
+                }
+            } else {
+                let reply_dest = multicast_dest.unwrap_or(peer);
+                if let Ok(tb) = OhmMessage::Track(track).encode() {
+                    let _ = socket.send_to(&tb, SocketAddr::V4(reply_dest)).await;
+                }
+                if let Ok(mb) = OhmMessage::Metatext(metatext).encode() {
+                    let _ = socket.send_to(&mb, SocketAddr::V4(reply_dest)).await;
+                }
             }
         }
         OhmMessage::Listen => {

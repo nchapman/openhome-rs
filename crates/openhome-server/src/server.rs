@@ -369,3 +369,57 @@ fn format_host(host: &str) -> String {
         host.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryRenderer;
+
+    #[test]
+    fn helpers_normalize_udn_format_ipv6_and_filter_empty() {
+        assert_eq!(normalize_udn("abc-123"), "uuid:abc-123");
+        assert_eq!(normalize_udn("uuid:already"), "uuid:already");
+        assert_eq!(non_empty(""), None);
+        assert_eq!(non_empty("hi"), Some("hi".into()));
+        assert_eq!(format_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(format_host("::1"), "[::1]");
+        assert_eq!(format_host("[::1]"), "[::1]");
+        assert_eq!(
+            resolve_advertise_host(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_setters_notify_helpers_and_shutdown_work() {
+        let renderer = MemoryRenderer::new("Studio", "Deck");
+        let server = renderer
+            .into_server_builder()
+            .udn("custom-udn-42")
+            .friendly_name("Custom Name")
+            .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .advertise_host("127.0.0.1")
+            .server_header("TestOS/1.0 UPnP/1.1 Test/1.0")
+            .ssdp(SsdpConfig::disabled())
+            .start()
+            .await
+            .unwrap();
+
+        assert_eq!(server.udn(), "uuid:custom-udn-42");
+        assert!(server.ssdp_addr().is_none());
+        assert!(server.description_url().starts_with("http://127.0.0.1:"));
+
+        // All notify_* helpers succeed cleanly with zero subscribers.
+        server.notify_product();
+        server.notify_playlist();
+        server.notify_info();
+        server.notify_time();
+        server.notify_volume();
+        server.notify_receiver();
+        server.notify_sender();
+        server.notify_all();
+        server.notify_service("NonExistent");
+
+        server.shutdown().await;
+    }
+}

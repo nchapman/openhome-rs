@@ -457,6 +457,12 @@ fn encode_slave(slaves: &[SocketAddrV4]) -> Result<Vec<u8>, SongcastError> {
     Ok(out)
 }
 
+/// Maximum slave entries accepted by `decode_slave` (protects against untrusted allocations).
+const MAX_DECODE_SLAVES: usize = 64;
+
+/// Maximum resend frame numbers accepted by `decode_resend`.
+const MAX_DECODE_RESEND_FRAMES: usize = 64;
+
 fn decode_slave(payload: &[u8]) -> Result<Vec<SocketAddrV4>, SongcastError> {
     if payload.len() < 4 {
         return Err(SongcastError::PacketTooShort {
@@ -465,6 +471,12 @@ fn decode_slave(payload: &[u8]) -> Result<Vec<SocketAddrV4>, SongcastError> {
         });
     }
     let count = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+    if count > MAX_DECODE_SLAVES {
+        return Err(SongcastError::PacketTooLarge {
+            max: MAX_DECODE_SLAVES,
+            actual: count,
+        });
+    }
     let expected = count.checked_mul(6).and_then(|n| n.checked_add(4)).ok_or(
         SongcastError::PacketTooShort {
             expected: usize::MAX,
@@ -512,6 +524,12 @@ fn decode_resend(payload: &[u8]) -> Result<Vec<u32>, SongcastError> {
         });
     }
     let count = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+    if count > MAX_DECODE_RESEND_FRAMES {
+        return Err(SongcastError::PacketTooLarge {
+            max: MAX_DECODE_RESEND_FRAMES,
+            actual: count,
+        });
+    }
     let expected = count.checked_mul(4).and_then(|n| n.checked_add(4)).ok_or(
         SongcastError::PacketTooShort {
             expected: usize::MAX,
@@ -638,6 +656,44 @@ mod tests {
         assert!(matches!(
             OhmMessage::decode(&bad_audio),
             Err(SongcastError::InvalidAudioHeaderLength(49))
+        ));
+        // Non-zero reserved byte rejected per ohSongcast/ohPipeline.
+        bad_audio[8] = 50;
+        bad_audio[8 + 48] = 7;
+        assert!(matches!(
+            OhmMessage::decode(&bad_audio),
+            Err(SongcastError::InvalidAudioHeaderLength(7))
+        ));
+        // Oversized Slave/Resend counts rejected before allocation.
+        let mut big_slave = OhmHeader::new(OhmMsgType::Slave, 4)
+            .unwrap()
+            .encode()
+            .to_vec();
+        big_slave.extend_from_slice(&(1_000_000u32).to_be_bytes());
+        assert!(matches!(
+            OhmMessage::decode(&big_slave),
+            Err(SongcastError::PacketTooLarge { .. })
+        ));
+        let mut big_resend = OhmHeader::new(OhmMsgType::Resend, 4)
+            .unwrap()
+            .encode()
+            .to_vec();
+        big_resend.extend_from_slice(&(1_000_000u32).to_be_bytes());
+        assert!(matches!(
+            OhmMessage::decode(&big_resend),
+            Err(SongcastError::PacketTooLarge { .. })
+        ));
+        // Invalid UTF-8 in Metatext rejected.
+        let mut bad_utf8 = OhmHeader::new(OhmMsgType::Metatext, 10)
+            .unwrap()
+            .encode()
+            .to_vec();
+        bad_utf8.extend_from_slice(&1u32.to_be_bytes());
+        bad_utf8.extend_from_slice(&2u32.to_be_bytes());
+        bad_utf8.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            OhmMessage::decode(&bad_utf8),
+            Err(SongcastError::InvalidUtf8(_))
         ));
         // Truncated Track / Metatext / Slave / Resend
         for msg_type in [

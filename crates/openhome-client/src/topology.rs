@@ -127,3 +127,60 @@ impl Topology {
             .filter(|d| d.attributes.receiver)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use openhome_core::SourceType;
+
+    use super::*;
+
+    #[test]
+    fn topology_accessors_visible_sources_and_oob_active_source() {
+        let entry = TopologyDevice {
+            udn: "uuid:deck".into(),
+            location: "http://127.0.0.1:80/desc.xml".into(),
+            friendly_name: "Deck".into(),
+            room: "Study".into(),
+            product_name: "Deck".into(),
+            standby: false,
+            sources: vec![
+                Source {
+                    name: "Playlist".into(),
+                    source_type: SourceType::Playlist,
+                    visible: true,
+                    system_name: "Playlist".into(),
+                },
+                Source {
+                    name: "Hidden".into(),
+                    source_type: SourceType::NetAux,
+                    visible: false,
+                    system_name: "Hidden".into(),
+                },
+            ],
+            source_index: 99, // OOB -> active_source() == None
+            attributes: DeviceAttributes::default(),
+        };
+
+        assert!(entry.active_source().is_none());
+        let visible: Vec<&str> = entry
+            .visible_sources()
+            .map(|(_, s)| s.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["Playlist"]);
+
+        let mut rooms = BTreeMap::new();
+        rooms.insert(
+            "Study".into(),
+            RoomTopology {
+                name: "Study".into(),
+                devices: vec![entry],
+            },
+        );
+        let topo = Topology { rooms };
+        assert_eq!(topo.rooms().count(), 1);
+        assert!(topo.room("Study").is_some());
+        assert!(topo.room("Missing").is_none());
+        assert_eq!(topo.senders().count(), 0);
+        assert_eq!(topo.receivers().count(), 0);
+    }
+}

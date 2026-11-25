@@ -252,6 +252,7 @@ async fn delivery_loop(
 ) {
     // Yield once so the SUBSCRIBE HTTP response can be flushed before SEQ=0.
     tokio::task::yield_now().await;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         if *cancel.borrow() {
@@ -295,6 +296,7 @@ async fn delivery_loop(
         }
 
         if delivered {
+            consecutive_failures = 0;
             let mut state = delivery.lock().expect("DeliveryState lock poisoned");
             if !state.initial_sent {
                 state.initial_sent = true;
@@ -309,9 +311,13 @@ async fn delivery_loop(
             }
         } else {
             // Transient delivery failure: confirmed_state is NOT advanced so the
-            // unconfirmed delta is preserved for retry or the next state change.
+            // unconfirmed delta is preserved for retry with capped exponential backoff.
+            let backoff_ms = 250u64
+                .saturating_mul(1u64 << consecutive_failures.min(4))
+                .min(4_000);
+            consecutive_failures = consecutive_failures.saturating_add(1);
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                 _ = wake.notified() => {}
                 _ = cancel.changed() => break,
             }

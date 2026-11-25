@@ -150,3 +150,141 @@ pub trait SenderService: Send + Sync {
     fn status(&self) -> SenderStatus;
     fn attributes(&self) -> String;
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use openhome_core::SourceType;
+
+    use super::*;
+
+    struct DummyProduct {
+        idx: Mutex<u32>,
+    }
+
+    impl ProductService for DummyProduct {
+        fn product_info(&self) -> ProductInfo {
+            ProductInfo::default()
+        }
+        fn attributes(&self) -> DeviceAttributes {
+            DeviceAttributes::default()
+        }
+        fn sources(&self) -> Vec<Source> {
+            vec![
+                Source {
+                    name: "My Playlist".into(),
+                    source_type: SourceType::Playlist,
+                    visible: true,
+                    system_name: "Playlist".into(),
+                },
+                Source {
+                    name: "Aux In".into(),
+                    source_type: SourceType::Analog,
+                    visible: true,
+                    system_name: "Aux".into(),
+                },
+            ]
+        }
+        fn source_index(&self) -> u32 {
+            *self.idx.lock().unwrap()
+        }
+        fn set_source_index(&self, index: u32) -> ActionResult<()> {
+            *self.idx.lock().unwrap() = index;
+            Ok(())
+        }
+        fn standby(&self) -> bool {
+            false
+        }
+        fn set_standby(&self, _standby: bool) -> ActionResult<()> {
+            Ok(())
+        }
+    }
+
+    struct DummyVolume {
+        chars: VolumeCharacteristics,
+        state: Mutex<VolumeState>,
+    }
+
+    impl VolumeService for DummyVolume {
+        fn characteristics(&self) -> VolumeCharacteristics {
+            self.chars
+        }
+        fn state(&self) -> VolumeState {
+            *self.state.lock().unwrap()
+        }
+        fn set_volume(&self, value: u32) -> ActionResult<()> {
+            self.state.lock().unwrap().volume = value;
+            Ok(())
+        }
+        fn volume_inc(&self) -> ActionResult<()> {
+            Ok(())
+        }
+        fn volume_dec(&self) -> ActionResult<()> {
+            Ok(())
+        }
+        fn set_mute(&self, value: bool) -> ActionResult<()> {
+            self.state.lock().unwrap().mute = value;
+            Ok(())
+        }
+        fn set_balance(&self, value: i32) -> ActionResult<()> {
+            self.state.lock().unwrap().balance = value;
+            Ok(())
+        }
+        fn set_fade(&self, value: i32) -> ActionResult<()> {
+            self.state.lock().unwrap().fade = value;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_product_and_volume_trait_methods_work() {
+        let p = DummyProduct { idx: Mutex::new(0) };
+        p.set_source_index_by_name("Aux In").unwrap();
+        assert_eq!(p.source_index(), 1);
+        p.set_source_by_system_name("Playlist").unwrap();
+        assert_eq!(p.source_index(), 0);
+        assert_eq!(
+            p.set_source_index_by_name("Missing").unwrap_err().code,
+            Fault::SOURCE_NOT_FOUND
+        );
+        assert_eq!(
+            p.set_source_by_system_name("Missing").unwrap_err().code,
+            Fault::SOURCE_NOT_FOUND
+        );
+
+        // Balance/fade max == 0 -> no-ops.
+        let v0 = DummyVolume {
+            chars: VolumeCharacteristics::default(),
+            state: Mutex::new(VolumeState::default()),
+        };
+        v0.balance_inc().unwrap();
+        v0.balance_dec().unwrap();
+        v0.fade_inc().unwrap();
+        v0.fade_dec().unwrap();
+        assert_eq!(v0.state().balance, 0);
+        assert_eq!(v0.state().fade, 0);
+
+        // Non-zero max -> increments/decrements clamp to [-max, max].
+        let v = DummyVolume {
+            chars: VolumeCharacteristics {
+                balance_max: 2,
+                fade_max: 1,
+                ..VolumeCharacteristics::default()
+            },
+            state: Mutex::new(VolumeState::default()),
+        };
+        v.balance_inc().unwrap();
+        v.balance_inc().unwrap();
+        v.balance_inc().unwrap();
+        assert_eq!(v.state().balance, 2);
+        v.balance_dec().unwrap();
+        assert_eq!(v.state().balance, 1);
+
+        v.fade_dec().unwrap();
+        v.fade_dec().unwrap();
+        assert_eq!(v.state().fade, -1);
+        v.fade_inc().unwrap();
+        assert_eq!(v.state().fade, 0);
+    }
+}

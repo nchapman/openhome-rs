@@ -73,7 +73,10 @@ pub fn decode_source_xml(xml: &str) -> Result<Vec<Source>, Error> {
                     match tag {
                         "Name" => name.push_str(&text),
                         "Type" => source_type.push_str(&text),
-                        "Visible" => visible = text.trim() == "true" || text.trim() == "1",
+                        "Visible" => {
+                            visible =
+                                crate::types::parse_upnp_bool("Visible", &text).unwrap_or(false)
+                        }
                         "SystemName" => system_name.push_str(&text),
                         _ => {}
                     }
@@ -85,7 +88,10 @@ pub fn decode_source_xml(xml: &str) -> Result<Vec<Source>, Error> {
                     match tag {
                         "Name" => name.push_str(&text),
                         "Type" => source_type.push_str(&text),
-                        "Visible" => visible = text.trim() == "true" || text.trim() == "1",
+                        "Visible" => {
+                            visible =
+                                crate::types::parse_upnp_bool("Visible", &text).unwrap_or(false)
+                        }
                         "SystemName" => system_name.push_str(&text),
                         _ => {}
                     }
@@ -568,14 +574,15 @@ mod tests {
                 .is_err()
         );
 
-        // SourceXml missing SystemName falls back to Name; Visible accepts 0/1; CDATA works.
-        let src_xml = "<SourceList><Source><Name><![CDATA[Line In]]></Name><Type>Analog</Type><Visible>0</Visible></Source></SourceList>";
+        // SourceXml missing SystemName falls back to Name; Visible accepts 0/1/True; CDATA works.
+        let src_xml = "<SourceList><Source><Name><![CDATA[Line In]]></Name><Type>Analog</Type><Visible>0</Visible></Source><Source><Name>Aux</Name><Type>Digital</Type><Visible>True</Visible></Source></SourceList>";
         let srcs = decode_source_xml(src_xml).unwrap();
-        assert_eq!(srcs.len(), 1);
+        assert_eq!(srcs.len(), 2);
         assert_eq!(srcs[0].name, "Line In");
         assert_eq!(srcs[0].system_name, "Line In");
         assert!(!srcs[0].visible);
         assert_eq!(srcs[0].source_type, SourceType::Analog);
+        assert!(srcs[1].visible);
 
         // TrackList invalid numeric Id errors cleanly; CDATA preserved.
         assert!(decode_track_list("<TrackList><Entry><Id>abc</Id></Entry></TrackList>").is_err());
