@@ -12,11 +12,12 @@ Consult [`docs/oracle.md`](docs/oracle.md) whenever verifying service XMLs, SOAP
 - Battle-tested interop reference: `medoc92/upmpdcli`
 
 ## Verification
-Run before committing:
+Managed via [`mise.toml`](mise.toml). Run before committing:
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+mise run check
 ```
+This runs formatting (`fmt:check`), strict clippy (`lint`), rustdoc (`doc`), and tests with per-crate line coverage thresholds (`cov` via [`scripts/coverage.sh`](scripts/coverage.sh): ≥90% workspace total, ≥92% `openhome-core`, ≥90% `openhome-server`/`openhome-client`, ≥80% `openhome-songcast`).
+- Quick local tidy loop: `mise run tidy` (`fmt`, `lint`, `test`).
+- HTML / missing-lines coverage views: `mise run cov:html` and `mise run cov:uncovered`.
 - `unsafe_code = "forbid"` is enforced workspace-wide.
 - Prefer round-trip `openhome-client` ↔ `openhome-server` integration tests over mocked wire internals.

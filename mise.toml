@@ -1,0 +1,45 @@
+[tools]
+rust = "latest"
+"cargo:cargo-llvm-cov" = "latest"
+jq = "latest"
+
+[tasks.fmt]
+description = "Format all Rust crates in the workspace"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Verify Rust formatting across the workspace"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Run clippy across all targets with warnings denied"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.doc]
+description = "Build workspace rustdoc with warnings denied"
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --workspace --no-deps"
+
+[tasks.test]
+description = "Run the full workspace test suite"
+run = "cargo test --workspace"
+
+[tasks.cov]
+description = "Run workspace tests with coverage and enforce per-crate thresholds"
+run = "./scripts/coverage.sh"
+
+[tasks."cov:html"]
+description = "Generate an HTML coverage report under target/llvm-cov/html"
+run = "cargo llvm-cov --workspace --html"
+
+[tasks."cov:uncovered"]
+description = "Show uncovered lines across the workspace (pass optional cargo-llvm-cov args)"
+run = "cargo llvm-cov --workspace --text --show-missing-lines"
+
+[tasks.tidy]
+description = "Auto-format and run lint + tests"
+depends = ["fmt", "lint", "test"]
+
+[tasks.check]
+description = "Full repository verification gate (fmt, lint, doc, coverage)"
+depends = ["fmt:check", "lint", "doc", "cov"]

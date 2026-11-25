@@ -346,45 +346,17 @@ pub fn decode_device_description(xml: &str) -> Result<DeviceDescription, Error> 
                 let text = String::from_utf8_lossy(e.as_ref());
                 url_base.get_or_insert_default().push_str(&text);
             }
-            Ok(Event::Text(e)) if device_depth == 1 => {
+            ev @ (Ok(Event::Text(_)) | Ok(Event::CData(_))) if device_depth == 1 => {
                 if let Some(tag) = current_tag.as_deref() {
-                    let text = e.unescape().map_err(|err| Error::Xml(err.to_string()))?;
-                    if in_service {
-                        match tag {
-                            "serviceType" => svc_type.push_str(&text),
-                            "serviceId" => svc_id.push_str(&text),
-                            "SCPDURL" => scpd_url.push_str(&text),
-                            "controlURL" => control_url.push_str(&text),
-                            "eventSubURL" => event_sub_url.push_str(&text),
-                            _ => {}
+                    let text: std::borrow::Cow<'_, str> = match ev {
+                        Ok(Event::Text(e)) => {
+                            e.unescape().map_err(|err| Error::Xml(err.to_string()))?
                         }
-                    } else {
-                        match tag {
-                            "deviceType" => device_type.push_str(&text),
-                            "friendlyName" => friendly_name.push_str(&text),
-                            "manufacturer" => manufacturer.push_str(&text),
-                            "manufacturerURL" => {
-                                manufacturer_url.get_or_insert_default().push_str(&text)
-                            }
-                            "modelDescription" => {
-                                model_description.get_or_insert_default().push_str(&text)
-                            }
-                            "modelName" => model_name.push_str(&text),
-                            "modelNumber" => model_number.get_or_insert_default().push_str(&text),
-                            "modelURL" => model_url.get_or_insert_default().push_str(&text),
-                            "serialNumber" => serial_number.get_or_insert_default().push_str(&text),
-                            "UDN" => udn.push_str(&text),
-                            "presentationURL" => {
-                                presentation_url.get_or_insert_default().push_str(&text)
-                            }
-                            _ => {}
+                        Ok(Event::CData(e)) => {
+                            String::from_utf8_lossy(e.as_ref()).into_owned().into()
                         }
-                    }
-                }
-            }
-            Ok(Event::CData(e)) if device_depth == 1 => {
-                if let Some(tag) = current_tag.as_deref() {
-                    let text = String::from_utf8_lossy(e.as_ref());
+                        _ => unreachable!(),
+                    };
                     if in_service {
                         match tag {
                             "serviceType" => svc_type.push_str(&text),
@@ -522,7 +494,7 @@ mod tests {
     #[test]
     fn device_description_roundtrip() {
         let desc = DeviceDescription {
-            url_base: None,
+            url_base: Some("http://192.168.1.10:8080/".into()),
             device_type: crate::urn::DEVICE_SOURCE_1.into(),
             friendly_name: "Living Room & Den".into(),
             manufacturer: "OpenHome RS".into(),
@@ -530,7 +502,7 @@ mod tests {
             model_description: Some("Pure Rust Renderer".into()),
             model_name: "openhome-rs".into(),
             model_number: Some("0.1".into()),
-            model_url: None,
+            model_url: Some("https://example.com/model".into()),
             serial_number: Some("12345".into()),
             udn: "uuid:11111111-2222-3333-4444-555555555555".into(),
             presentation_url: Some("/".into()),
@@ -543,7 +515,13 @@ mod tests {
             }],
         };
         let xml = encode_device_description(&desc);
-        assert_eq!(decode_device_description(&xml).unwrap(), desc);
+        let decoded = decode_device_description(&xml).unwrap();
+        assert_eq!(decoded, desc);
+        assert!(
+            decoded
+                .find_service_by_id(crate::urn::SERVICE_ID_PRODUCT)
+                .is_some()
+        );
     }
 
     #[test]

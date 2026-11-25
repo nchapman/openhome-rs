@@ -435,33 +435,68 @@ mod tests {
 
     #[test]
     fn enums_and_attributes_parsing() {
-        assert_eq!(SourceType::parse(" Playlist "), SourceType::Playlist);
+        for (raw, expected) in [
+            ("Playlist", SourceType::Playlist),
+            ("Radio", SourceType::Radio),
+            ("Receiver", SourceType::Receiver),
+            ("UpnpAv", SourceType::UpnpAv),
+            ("NetAux", SourceType::NetAux),
+            ("Analog", SourceType::Analog),
+            ("Digital", SourceType::Digital),
+            ("Hdmi", SourceType::Hdmi),
+            ("CustomSrc", SourceType::Other("CustomSrc".into())),
+        ] {
+            let parsed = SourceType::parse(&format!(" {raw} "));
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), raw);
+            assert_eq!(parsed.to_string(), raw);
+        }
+
+        let all_attrs =
+            DeviceAttributes::parse("Info Time Volume Sender Receiver Credentials Extra");
+        assert!(
+            all_attrs.info
+                && all_attrs.time
+                && all_attrs.volume
+                && all_attrs.sender
+                && all_attrs.receiver
+                && all_attrs.credentials
+        );
         assert_eq!(
-            SourceType::parse("CustomSrc"),
-            SourceType::Other("CustomSrc".into())
+            all_attrs.to_attribute_string(),
+            "Info Time Volume Sender Receiver Credentials"
         );
 
-        let attrs = DeviceAttributes::parse("Info Volume UnknownToken Receiver");
-        assert!(attrs.info && attrs.volume && attrs.receiver);
-        assert!(!attrs.time && !attrs.sender && !attrs.credentials);
-        assert_eq!(attrs.to_attribute_string(), "Info Volume Receiver");
-
-        assert_eq!(
-            TransportState::parse(" Playing "),
-            Some(TransportState::Playing)
-        );
+        for (s, v) in [
+            ("Stopped", TransportState::Stopped),
+            ("Playing", TransportState::Playing),
+            ("Paused", TransportState::Paused),
+            ("Buffering", TransportState::Buffering),
+        ] {
+            assert_eq!(TransportState::parse(&format!(" {s} ")), Some(v));
+            assert_eq!(v.as_str(), s);
+        }
         assert_eq!(TransportState::parse("Bogus"), None);
 
-        assert_eq!(
-            ReceiverState::parse(" Waiting\n"),
-            Some(ReceiverState::Waiting)
-        );
+        for (s, v) in [
+            ("Stopped", ReceiverState::Stopped),
+            ("Playing", ReceiverState::Playing),
+            ("Waiting", ReceiverState::Waiting),
+            ("Buffering", ReceiverState::Buffering),
+        ] {
+            assert_eq!(ReceiverState::parse(&format!(" {s}\n")), Some(v));
+            assert_eq!(v.as_str(), s);
+        }
         assert_eq!(ReceiverState::parse("Unknown"), None);
 
-        assert_eq!(
-            SenderStatus::parse(" Blocked "),
-            Some(SenderStatus::Blocked)
-        );
+        for (s, v) in [
+            ("Disabled", SenderStatus::Disabled),
+            ("Enabled", SenderStatus::Enabled),
+            ("Blocked", SenderStatus::Blocked),
+        ] {
+            assert_eq!(SenderStatus::parse(&format!(" {s} ")), Some(v));
+            assert_eq!(v.as_str(), s);
+        }
         assert_eq!(SenderStatus::parse("Unknown"), None);
     }
 }
