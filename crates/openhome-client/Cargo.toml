@@ -1,0 +1,23 @@
+[package]
+name = "openhome-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async OpenHome Media control point client (SSDP discovery, typed service clients, GENA subscriptions)"
+
+[lints]
+workspace = true
+
+[dependencies]
+openhome-core.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server", "client", "http1"] }
+hyper-util.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

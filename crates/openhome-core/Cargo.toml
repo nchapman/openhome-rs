@@ -1,0 +1,17 @@
+[package]
+name = "openhome-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Core protocol types, XML/SOAP/GENA codecs, and SCPD definitions for OpenHome Media"
+
+[lints]
+workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+thiserror.workspace = true

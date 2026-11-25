@@ -1,0 +1,24 @@
+[package]
+name = "openhome-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async OpenHome Media renderer server (SSDP, SOAP, GENA eventing, and service traits)"
+
+[lints]
+workspace = true
+
+[dependencies]
+openhome-core.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server", "client", "http1"] }
+hyper-util.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
