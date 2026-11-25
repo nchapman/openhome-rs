@@ -3,12 +3,11 @@
 set -euo pipefail
 
 # Per-crate minimum line coverage percentages.
-# Keep pure protocol/codec crates strictest; raise openhome-songcast in Pass 2.
 MIN_TOTAL=90
 MIN_OPENHOME_CORE=92
 MIN_OPENHOME_SERVER=90
 MIN_OPENHOME_CLIENT=90
-MIN_OPENHOME_SONGCAST=80
+MIN_OPENHOME_SONGCAST=92
 LOW_FILE_WARN=85
 
 tmp_json="$(mktemp -t openhome-cov.XXXXXX.json)"
