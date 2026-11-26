@@ -1,0 +1,43 @@
+[package]
+name = "openhome-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Self-contained OpenHome Media + Songcast audio player powered by Symphonia and optional cpal output"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cpal-output = ["dep:cpal"]
+
+[dependencies]
+openhome-core.workspace = true
+openhome-server.workspace = true
+openhome-songcast.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+symphonia = { version = "0.5", default-features = false, features = [
+    "aac",
+    "aiff",
+    "alac",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+cpal = { version = "0.15", optional = true }
+
+[dev-dependencies]
+openhome-client.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

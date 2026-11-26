@@ -5,6 +5,7 @@ members = [
     "crates/openhome-server",
     "crates/openhome-client",
     "crates/openhome-songcast",
+    "crates/openhome-player",
     "tests/integration",
 ]
 
@@ -28,6 +29,7 @@ openhome-core = { path = "crates/openhome-core", version = "0.1.0" }
 openhome-server = { path = "crates/openhome-server", version = "0.1.0" }
 openhome-client = { path = "crates/openhome-client", version = "0.1.0" }
 openhome-songcast = { path = "crates/openhome-songcast", version = "0.1.0" }
+openhome-player = { path = "crates/openhome-player", version = "0.1.0" }
 
 bytes = "1"
 http-body-util = "0.1"

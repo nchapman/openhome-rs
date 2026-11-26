@@ -310,6 +310,25 @@ impl MemoryRenderer {
         self.inner.write().unwrap().time.seconds = seconds;
     }
 
+    /// Update current `Playlist` transport state (e.g. `Buffering` → `Playing`).
+    pub fn set_transport_state(&self, state: TransportState) {
+        self.inner.write().unwrap().transport_state = state;
+    }
+
+    /// Update current `Receiver` (Songcast) transport state.
+    pub fn set_receiver_state(&self, state: ReceiverState) {
+        self.inner.write().unwrap().receiver_state = state;
+    }
+
+    /// Update current `Info` track URI and DIDL-Lite metadata (increments `TrackCount`).
+    pub fn set_info_track(&self, uri: impl Into<String>, metadata: impl Into<String>) {
+        let mut inner = self.inner.write().unwrap();
+        inner.current_uri = uri.into();
+        inner.current_metadata = metadata.into();
+        inner.counters.track_count = inner.counters.track_count.wrapping_add(1);
+        inner.time.track_count = inner.counters.track_count;
+    }
+
     /// Update Songcast `Sender` state.
     pub fn set_sender_info(
         &self,
