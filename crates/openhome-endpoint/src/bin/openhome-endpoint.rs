@@ -15,8 +15,10 @@ use openhome_server::SsdpConfig;
 struct CliArgs {
     room: String,
     name: String,
+    udn: Option<String>,
     bind_addr: SocketAddr,
     advertise_host: Option<String>,
+    songcast_interface: Ipv4Addr,
     device: String,
     disable_ssdp: bool,
     help: bool,
@@ -31,8 +33,10 @@ impl CliArgs {
         let mut out = Self {
             room: "Living Room".into(),
             name: "OpenHome Endpoint".into(),
+            udn: None,
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             advertise_host: None,
+            songcast_interface: Ipv4Addr::UNSPECIFIED,
             device: "default".into(),
             disable_ssdp: false,
             help: false,
@@ -43,6 +47,7 @@ impl CliArgs {
             match arg.as_str() {
                 "--room" => out.room = args.next().ok_or("--room requires a value")?,
                 "--name" => out.name = args.next().ok_or("--name requires a value")?,
+                "--udn" => out.udn = Some(args.next().ok_or("--udn requires a value")?),
                 "--bind" => {
                     let raw = args.next().ok_or("--bind requires ip:port")?;
                     out.bind_addr = raw.parse().map_err(|e| format!("invalid --bind: {e}"))?;
@@ -50,6 +55,12 @@ impl CliArgs {
                 "--advertise-host" => {
                     out.advertise_host =
                         Some(args.next().ok_or("--advertise-host requires a value")?);
+                }
+                "--songcast-interface" => {
+                    let raw = args.next().ok_or("--songcast-interface requires an IPv4")?;
+                    out.songcast_interface = raw
+                        .parse()
+                        .map_err(|e| format!("invalid --songcast-interface: {e}"))?;
                 }
                 "--device" => out.device = args.next().ok_or("--device requires a value")?,
                 "--no-ssdp" => out.disable_ssdp = true,
@@ -77,10 +88,15 @@ impl CliArgs {
         EndpointConfig {
             room: self.room,
             name: self.name,
+            udn: self.udn,
             bind_addr: self.bind_addr,
             advertise_host: self.advertise_host,
+            songcast_interface: self.songcast_interface,
             ssdp,
             sink,
+            on_error: Some(Arc::new(|msg| {
+                eprintln!("openhome-endpoint error: {msg}");
+            })),
             ..EndpointConfig::default()
         }
     }
@@ -92,7 +108,7 @@ async fn run_cli(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if cli.help {
         eprintln!(
-            "openhome-endpoint [--room NAME] [--name NAME] [--bind IP:PORT] [--advertise-host HOST] [--device default|null|NAME] [--no-ssdp]"
+            "openhome-endpoint [--room NAME] [--name NAME] [--udn UDN] [--bind IP:PORT] [--advertise-host HOST] [--songcast-interface IPV4] [--device default|null|NAME] [--no-ssdp]"
         );
         return Ok(());
     }
@@ -113,13 +129,32 @@ async fn run_cli(
     Ok(())
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(s) = sigterm.as_mut() {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = CliArgs::parse_from(std::env::args().skip(1))?;
-    run_cli(cli, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
+    run_cli(cli, shutdown_signal()).await
 }
 
 #[cfg(test)]
@@ -133,9 +168,13 @@ mod tests {
             "Kitchen",
             "--name",
             "HiFi",
+            "--udn",
+            "uuid:12345678-1234-1234-1234-123456789abc",
             "--bind",
             "127.0.0.1:49152",
             "--advertise-host",
+            "127.0.0.1",
+            "--songcast-interface",
             "127.0.0.1",
             "--device",
             "null",
@@ -144,11 +183,17 @@ mod tests {
         .unwrap();
         assert_eq!(cli.room, "Kitchen");
         assert_eq!(cli.name, "HiFi");
+        assert_eq!(
+            cli.udn.as_deref(),
+            Some("uuid:12345678-1234-1234-1234-123456789abc")
+        );
         assert_eq!(cli.bind_addr, "127.0.0.1:49152".parse().unwrap());
         assert_eq!(cli.advertise_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cli.songcast_interface, Ipv4Addr::LOCALHOST);
         assert!(cli.disable_ssdp);
         let cfg = cli.into_config();
         assert_eq!(cfg.room, "Kitchen");
+        (cfg.on_error.as_ref().expect("on_error"))("test diagnostic");
 
         let default_cfg = CliArgs::parse_from(["--device", "default"])
             .unwrap()
@@ -164,6 +209,7 @@ mod tests {
         assert!(CliArgs::parse_from(["--help"]).unwrap().help);
         assert!(CliArgs::parse_from(["--unknown"]).is_err());
         assert!(CliArgs::parse_from(["--bind", "bad"]).is_err());
+        assert!(CliArgs::parse_from(["--songcast-interface", "not-an-ip"]).is_err());
     }
 
     #[tokio::test]

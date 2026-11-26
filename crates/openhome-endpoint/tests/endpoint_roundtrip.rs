@@ -1,4 +1,4 @@
-//! End-to-end integration tests for `openhome-player` using `openhome-client`,
+//! End-to-end integration tests for `openhome-endpoint` using `openhome-client`,
 //! loopback HTTP WAV serving, `SongcastSender`, and `CaptureSink`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -924,4 +924,320 @@ async fn songcast_sink_open_and_write_errors_tear_down_without_storm() {
     engine2.shutdown_async().await;
 
     sender.shutdown().await;
+}
+
+/// Regression tests for SME review findings:
+/// - M1: Real-time-paced Songcast sink never starves SetVolume / Receiver.Stop / shutdown
+/// - M4: Gapless sink reuse across EOF (zero flush), flush on manual skip, drain at end-of-playlist
+/// - M7 + S4 + S6: Receiver.Play with empty URI -> Stopped, invalid SetSender rejected synchronously,
+///   Previous while Paused at track 0 seeks decoder, Songcast same-spec track updates Details, on_error fires.
+#[tokio::test]
+async fn sme_regressions_realtime_songcast_gapless_drain_and_state_sync() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    // 1. M1 + M7: Active Songcast into a real-time-paced sink with continuous 5ms sender stream
+    // must remain responsive to SetVolume, same-spec track Details updates, Receiver.Stop, and shutdown.
+    let rt_sink = Arc::new(CaptureSink::realtime());
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errors_cb = Arc::clone(&errors);
+    let endpoint = OpenHomeEndpoint::start(EndpointConfig {
+        room: "SME Room".into(),
+        name: "SME Endpoint".into(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        songcast_interface: Ipv4Addr::LOCALHOST,
+        sink: rt_sink.clone(),
+        on_error: Some(Arc::new(move |msg| {
+            errors_cb.lock().unwrap().push(msg.to_string());
+        })),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let dev = OpenHomeDevice::connect(endpoint.description_url())
+        .await
+        .expect("connect");
+
+    // S6: Malformed Songcast URI rejected synchronously by Receiver.SetSender.
+    assert!(
+        dev.receiver()
+            .unwrap()
+            .set_sender("not-a-songcast-uri", "")
+            .await
+            .is_err()
+    );
+
+    // M7: Receiver.Play with empty sender URI must not leave ReceiverState stuck in Playing.
+    dev.receiver().unwrap().play().await.unwrap();
+    assert_eq!(
+        dev.receiver().unwrap().transport_state().await.unwrap(),
+        ReceiverState::Stopped
+    );
+
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        advertise_ip: Some(Ipv4Addr::LOCALHOST),
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+
+    dev.receiver()
+        .unwrap()
+        .set_sender(&sender.uri().to_string(), "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    dev.receiver().unwrap().play().await.unwrap();
+
+    let stop_sender = Arc::new(Notify::new());
+    let stop_sender_bg = Arc::clone(&stop_sender);
+    let track2_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let track2_bg = Arc::clone(&track2_flag);
+
+    // Continuously push 5 ms stereo 16-bit @ 44.1 kHz packets in the background.
+    let sender_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        let pcm_be: Vec<u8> = [0x01, 0x00].repeat(220 * 2);
+        let mut cfg1 = AudioFormat::pcm(44_100, 16, 2);
+        cfg1.samples_total = 44_100 * 60;
+        cfg1.bit_rate = 1_411_200;
+        cfg1.codec = "FLAC".into();
+
+        let mut cfg2 = AudioFormat::pcm(44_100, 16, 2);
+        cfg2.samples_total = 44_100 * 180;
+        cfg2.bit_rate = 900_000;
+        cfg2.codec = "ALAC".into();
+
+        loop {
+            tokio::select! {
+                _ = stop_sender_bg.notified() => break,
+                _ = tick.tick() => {
+                    let cfg = if track2_bg.load(Ordering::Acquire) { &cfg2 } else { &cfg1 };
+                    let _ = sender.send_audio(cfg, pcm_be.clone(), false).await;
+                }
+            }
+        }
+        sender.shutdown().await;
+    });
+
+    // Wait for Playing + Track 1 Details.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if dev.receiver().unwrap().transport_state().await.unwrap() == ReceiverState::Playing
+            && dev.info().unwrap().details().await.unwrap().duration == 60
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(dev.info().unwrap().details().await.unwrap().duration, 60);
+
+    // Switch sender to Track 2 with IDENTICAL PcmSpec (44.1kHz/16-bit/2ch) -> Details must still update!
+    track2_flag.store(true, Ordering::Release);
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline2 {
+        if dev.info().unwrap().details().await.unwrap().duration == 180 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let details2 = dev.info().unwrap().details().await.unwrap();
+    assert_eq!(details2.duration, 180);
+    assert_eq!(details2.codec_name, "ALAC");
+
+    // While sender is STILL continuously streaming, SetVolume + Receiver.Stop + shutdown must complete promptly!
+    dev.volume().unwrap().set_volume(40).await.unwrap();
+    dev.receiver().unwrap().stop().await.unwrap();
+    assert_eq!(
+        dev.receiver().unwrap().transport_state().await.unwrap(),
+        ReceiverState::Stopped
+    );
+
+    // Shutdown endpoint BEFORE stopping sender -> proves M1 does not deadlock shutdown.
+    tokio::time::timeout(Duration::from_secs(3), endpoint.shutdown())
+        .await
+        .expect("endpoint shutdown must not hang during active Songcast stream");
+
+    stop_sender.notify_one();
+    let _ = sender_task.await;
+
+    // 2. M4 + M7(Previous while Paused) + S4(on_error): Verify gapless reuse, manual flush, drain on EOF.
+    #[derive(Default)]
+    struct TrackingSink {
+        opens: AtomicUsize,
+        flushes: AtomicUsize,
+        drains: AtomicUsize,
+        pace_ms: AtomicUsize,
+    }
+    struct TrackingStream {
+        spec: openhome_audio::PcmSpec,
+        parent: Arc<TrackingSink>,
+    }
+    impl openhome_audio::SinkStream for TrackingStream {
+        fn spec(&self) -> openhome_audio::PcmSpec {
+            self.spec
+        }
+        fn write(&mut self, _samples: &[f32]) -> Result<(), openhome_audio::AudioError> {
+            let ms = self.parent.pace_ms.load(Ordering::Acquire);
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms as u64));
+            }
+            Ok(())
+        }
+        fn flush(&mut self) {
+            self.parent.flushes.fetch_add(1, Ordering::AcqRel);
+        }
+        fn drain(&mut self) {
+            self.parent.drains.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    struct SharedTrackingSink(Arc<TrackingSink>);
+    impl openhome_audio::AudioSink for SharedTrackingSink {
+        fn name(&self) -> &str {
+            "shared-tracking"
+        }
+        fn open(
+            &self,
+            spec: openhome_audio::PcmSpec,
+        ) -> Result<Box<dyn openhome_audio::SinkStream>, openhome_audio::AudioError> {
+            self.0.opens.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(TrackingStream {
+                spec,
+                parent: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    let wav_short = synth_wav(44_100, 4410, 0.5); // 100 ms
+    let (http_addr, http_task) = spawn_wav_http_server(wav_short.clone(), wav_short).await;
+    let http_base = format!("http://{http_addr}");
+
+    let tracker = Arc::new(TrackingSink::default());
+    let err_count = Arc::new(AtomicUsize::new(0));
+    let err_count_cb = Arc::clone(&err_count);
+    let ep2 = OpenHomeEndpoint::start(EndpointConfig {
+        room: "Gapless".into(),
+        name: "Gapless Endpoint".into(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        sink: Arc::new(SharedTrackingSink(Arc::clone(&tracker))),
+        on_error: Some(Arc::new(move |_| {
+            err_count_cb.fetch_add(1, Ordering::AcqRel);
+        })),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+    let dev2 = OpenHomeDevice::connect(ep2.description_url())
+        .await
+        .unwrap();
+    let pl2 = dev2.playlist().unwrap();
+
+    let id1 = pl2
+        .insert(0, &format!("{http_base}/track1.wav"), "")
+        .await
+        .unwrap();
+    pl2.insert(id1, &format!("{http_base}/track2.wav"), "")
+        .await
+        .unwrap();
+    pl2.play().await.unwrap();
+
+    // Wait for both tracks to auto-advance gaplessly and finish at Stopped.
+    let deadline3 = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline3 {
+        if pl2.transport_state().await.unwrap() == TransportState::Stopped
+            && tracker.drains.load(Ordering::Acquire) >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // True gapless: 2 tracks opened the sink ONCE, 0 flushes during auto-advance, 1 drain at end-of-playlist!
+    assert_eq!(tracker.opens.load(Ordering::Acquire), 1);
+    assert_eq!(tracker.flushes.load(Ordering::Acquire), 0);
+    assert_eq!(tracker.drains.load(Ordering::Acquire), 1);
+
+    // Gapless format change (44.1 kHz -> 48 kHz) drains previous tail and reopens sink,
+    // and manual skip while playing flushes immediately without bleed.
+    let wav_44 = synth_wav(44_100, 4410, 0.5);
+    let wav_48 = synth_wav(48_000, 4800, 0.5);
+    let (http_addr2, http_task2) = spawn_wav_http_server(wav_44, wav_48).await;
+    let http_base2 = format!("http://{http_addr2}");
+
+    pl2.delete_all().await.unwrap();
+    let f1 = pl2
+        .insert(0, &format!("{http_base2}/track1.wav"), "")
+        .await
+        .unwrap();
+    pl2.insert(f1, &format!("{http_base2}/track2.wav"), "")
+        .await
+        .unwrap();
+    pl2.play().await.unwrap();
+    let deadline_fmt = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline_fmt {
+        if pl2.transport_state().await.unwrap() == TransportState::Stopped
+            && tracker.drains.load(Ordering::Acquire) >= 3
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Format switch opened new 48 kHz sink (2 more opens) and drained twice (on switch + on EOF).
+    assert!(tracker.opens.load(Ordering::Acquire) >= 3);
+    assert!(tracker.drains.load(Ordering::Acquire) >= 3);
+
+    // M7: Previous while Paused at track 0 seeks decoder back to 0 without re-downloading.
+    // Also verify manual skip while playing flushes the reusable sink immediately.
+    tracker.pace_ms.store(30, Ordering::Release);
+    pl2.delete_all().await.unwrap();
+    let p1 = pl2
+        .insert(0, &format!("{http_base}/track1.wav"), "")
+        .await
+        .unwrap();
+    pl2.insert(p1, &format!("{http_base}/track2.wav"), "")
+        .await
+        .unwrap();
+    let flushes_before = tracker.flushes.load(Ordering::Acquire);
+    pl2.play().await.unwrap();
+    // Wait until playing so manual skip happens while active track is loaded.
+    let deadline_play = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline_play
+        && pl2.transport_state().await.unwrap() != TransportState::Playing
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    pl2.next().await.unwrap();
+    pl2.pause().await.unwrap();
+    let deadline_flush = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline_flush
+        && tracker.flushes.load(Ordering::Acquire) <= flushes_before
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        tracker.flushes.load(Ordering::Acquire) > flushes_before,
+        "manual skip / pause must flush sink"
+    );
+    pl2.previous().await.unwrap();
+    pl2.play().await.unwrap();
+    pl2.pause().await.unwrap();
+    pl2.previous().await.unwrap();
+    assert_eq!(dev2.time().unwrap().time().await.unwrap().seconds, 0);
+    tracker.pace_ms.store(0, Ordering::Release);
+
+    // Trigger an error (404 track) -> on_error callback fires.
+    pl2.delete_all().await.unwrap();
+    pl2.insert(0, &format!("{http_base}/missing.wav"), "")
+        .await
+        .unwrap();
+    pl2.play().await.unwrap();
+    let deadline4 = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline4 && err_count.load(Ordering::Acquire) == 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(err_count.load(Ordering::Acquire) >= 1);
+
+    ep2.shutdown().await;
+    http_task.abort();
+    http_task2.abort();
 }

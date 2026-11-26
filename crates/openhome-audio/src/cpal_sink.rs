@@ -35,30 +35,30 @@ fn negotiate_cpal_config(
     spec: PcmSpec,
 ) -> Result<(cpal::StreamConfig, cpal::SampleFormat), AudioError> {
     if let Ok(ranges) = device.supported_output_configs() {
-        let mut best: Option<(u32, cpal::StreamConfig, cpal::SampleFormat)> = None;
+        // Lexicographic priority:
+        // 1. Prefer channel counts >= requested (avoid downmixing stereo to mono)
+        // 2. Closest channel count to requested
+        // 3. Closest sample rate to requested
+        // 4. Highest precision sample format: F32 < I32 < I16 < U16
+        type Score = (u8, u16, u32, u8);
+        let mut best: Option<(Score, cpal::StreamConfig, cpal::SampleFormat)> = None;
         for range in ranges {
             let fmt = range.sample_format();
-            if !matches!(
-                fmt,
-                cpal::SampleFormat::F32
-                    | cpal::SampleFormat::I16
-                    | cpal::SampleFormat::I32
-                    | cpal::SampleFormat::U16
-            ) {
-                continue;
-            }
+            let fmt_rank = match fmt {
+                cpal::SampleFormat::F32 => 0,
+                cpal::SampleFormat::I32 => 1,
+                cpal::SampleFormat::I16 => 2,
+                cpal::SampleFormat::U16 => 3,
+                _ => continue,
+            };
             let min_r = range.min_sample_rate().0;
             let max_r = range.max_sample_rate().0;
             let rate = spec.sample_rate.clamp(min_r, max_r);
             let ch = range.channels();
-            let rate_pen = rate.abs_diff(spec.sample_rate);
-            let ch_pen = u32::from(ch.abs_diff(spec.channels)) * 100_000;
-            let fmt_pen = if fmt == cpal::SampleFormat::F32 {
-                0
-            } else {
-                10
-            };
-            let score = rate_pen.saturating_add(ch_pen).saturating_add(fmt_pen);
+            let downmix_pen = u8::from(ch < spec.channels);
+            let ch_diff = ch.abs_diff(spec.channels);
+            let rate_diff = rate.abs_diff(spec.sample_rate);
+            let score: Score = (downmix_pen, ch_diff, rate_diff, fmt_rank);
             let cfg = range.with_sample_rate(cpal::SampleRate(rate)).into();
             if best.as_ref().is_none_or(|(b, _, _)| score < *b) {
                 best = Some((score, cfg, fmt));
@@ -109,24 +109,51 @@ impl AudioSink for CpalSink {
             err_flag.store(true, Ordering::Release);
         };
 
+        // Zero-allocation RT callback chunking (fixed stack buffer, channel-aligned).
+        let ch = usize::from(out_channels.max(1));
+        let stack_step = if ch <= 512 { (512 / ch) * ch } else { ch };
+
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 &config,
                 move |out: &mut [f32], _| {
                     cb_ring.pop_into(out);
+                    for s in out.iter_mut() {
+                        if !s.is_finite() {
+                            *s = 0.0;
+                        }
+                    }
                 },
                 err_fn,
                 None,
             ),
             cpal::SampleFormat::I16 => {
-                let mut scratch = Vec::new();
+                // Pre-allocated fallback only if an exotic device has >512 channels.
+                let mut scratch = if ch > 512 {
+                    vec![0.0f32; ch]
+                } else {
+                    Vec::new()
+                };
                 device.build_output_stream(
                     &config,
                     move |out: &mut [i16], _| {
-                        scratch.resize(out.len(), 0.0);
-                        cb_ring.pop_into(&mut scratch);
-                        for (dst, &s) in out.iter_mut().zip(scratch.iter()) {
-                            *dst = (s.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                        let mut stack_buf = [0.0f32; 512];
+                        let buf: &mut [f32] = if ch <= 512 {
+                            &mut stack_buf[..stack_step]
+                        } else {
+                            &mut scratch[..ch]
+                        };
+                        for chunk in out.chunks_mut(buf.len()) {
+                            let len = chunk.len();
+                            cb_ring.pop_into(&mut buf[..len]);
+                            for (dst, &s) in chunk.iter_mut().zip(&buf[..len]) {
+                                let clean = if s.is_finite() {
+                                    s.clamp(-1.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                *dst = (clean * 32_767.0) as i16;
+                            }
                         }
                     },
                     err_fn,
@@ -134,14 +161,31 @@ impl AudioSink for CpalSink {
                 )
             }
             cpal::SampleFormat::I32 => {
-                let mut scratch = Vec::new();
+                let mut scratch = if ch > 512 {
+                    vec![0.0f32; ch]
+                } else {
+                    Vec::new()
+                };
                 device.build_output_stream(
                     &config,
                     move |out: &mut [i32], _| {
-                        scratch.resize(out.len(), 0.0);
-                        cb_ring.pop_into(&mut scratch);
-                        for (dst, &s) in out.iter_mut().zip(scratch.iter()) {
-                            *dst = (s.clamp(-1.0, 1.0) * 2_147_483_647.0) as i32;
+                        let mut stack_buf = [0.0f32; 512];
+                        let buf: &mut [f32] = if ch <= 512 {
+                            &mut stack_buf[..stack_step]
+                        } else {
+                            &mut scratch[..ch]
+                        };
+                        for chunk in out.chunks_mut(buf.len()) {
+                            let len = chunk.len();
+                            cb_ring.pop_into(&mut buf[..len]);
+                            for (dst, &s) in chunk.iter_mut().zip(&buf[..len]) {
+                                let clean = if s.is_finite() {
+                                    s.clamp(-1.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                *dst = (clean * 2_147_483_647.0) as i32;
+                            }
                         }
                     },
                     err_fn,
@@ -149,14 +193,31 @@ impl AudioSink for CpalSink {
                 )
             }
             cpal::SampleFormat::U16 => {
-                let mut scratch = Vec::new();
+                let mut scratch = if ch > 512 {
+                    vec![0.0f32; ch]
+                } else {
+                    Vec::new()
+                };
                 device.build_output_stream(
                     &config,
                     move |out: &mut [u16], _| {
-                        scratch.resize(out.len(), 0.0);
-                        cb_ring.pop_into(&mut scratch);
-                        for (dst, &s) in out.iter_mut().zip(scratch.iter()) {
-                            *dst = ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65_535.0) as u16;
+                        let mut stack_buf = [0.0f32; 512];
+                        let buf: &mut [f32] = if ch <= 512 {
+                            &mut stack_buf[..stack_step]
+                        } else {
+                            &mut scratch[..ch]
+                        };
+                        for chunk in out.chunks_mut(buf.len()) {
+                            let len = chunk.len();
+                            cb_ring.pop_into(&mut buf[..len]);
+                            for (dst, &s) in chunk.iter_mut().zip(&buf[..len]) {
+                                let clean = if s.is_finite() {
+                                    s.clamp(-1.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                *dst = ((clean * 0.5 + 0.5) * 65_535.0) as u16;
+                            }
                         }
                     },
                     err_fn,
@@ -204,7 +265,8 @@ impl SinkStream for CpalStream {
         }
 
         let to_write = if self.adapter.is_passthrough() {
-            samples
+            let ch = usize::from(self.spec.channels.max(1));
+            &samples[..(samples.len() / ch) * ch]
         } else {
             self.adapter.process(samples, &mut self.adapted_buf);
             &self.adapted_buf
@@ -233,5 +295,15 @@ impl SinkStream for CpalStream {
     fn flush(&mut self) {
         self.ring.clear();
         self.adapter.reset();
+    }
+
+    fn drain(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !self.ring.is_empty()
+            && !self.failed.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

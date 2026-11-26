@@ -14,6 +14,7 @@ use openhome_server::{
     ActionResult, InfoService, MemoryRenderer, OpenHomeServer, PlaylistService, ProductService,
     ReceiverService, ServerNotifier, SsdpConfig, TimeService, VolumeService,
 };
+use openhome_songcast::SongcastUri;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -35,6 +36,9 @@ http-get:*:audio/aiff:*,\
 http-get:*:audio/x-aiff:*,\
 http-get:*:audio/ogg:*,\
 http-get:*:application/ogg:*";
+
+/// Callback invoked when the playback engine encounters a decode, network, or sink error.
+pub type ErrorCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Configuration for starting an [`OpenHomeEndpoint`].
 #[derive(Clone)]
@@ -60,6 +64,8 @@ pub struct EndpointConfig {
     pub allow_local_files: bool,
     /// Audio output sink (`NullSink`, `CaptureSink`, or `CpalSink`).
     pub sink: Arc<dyn AudioSink>,
+    /// Optional callback invoked when the playback engine encounters a decode, network, or sink error.
+    pub on_error: Option<ErrorCallback>,
 }
 
 impl std::fmt::Debug for EndpointConfig {
@@ -86,6 +92,7 @@ impl Default for EndpointConfig {
             songcast_interface: Ipv4Addr::UNSPECIFIED,
             allow_local_files: false,
             sink: Arc::new(NullSink::realtime()),
+            on_error: None,
         }
     }
 }
@@ -97,6 +104,7 @@ struct EndpointCore {
     loaded_track_id: AtomicU32,
     songcast_interface: Ipv4Addr,
     allow_local_files: bool,
+    on_error: Option<ErrorCallback>,
     notifier: OnceLock<ServerNotifier>,
 }
 
@@ -150,6 +158,10 @@ impl EndpointCore {
             return;
         }
         if let Ok(entry) = self.state.read(id) {
+            if !paused {
+                // Transition to Buffering synchronously so SOAP/GENA does not flicker Playing->Buffering->Playing.
+                self.state.set_transport_state(TransportState::Buffering);
+            }
             let generation = self.next_generation();
             self.loaded_track_id.store(id, Ordering::Release);
             self.engine.send(EngineCommand::Load {
@@ -199,7 +211,7 @@ impl EndpointCore {
                     self.load_current_track(false);
                 } else {
                     self.loaded_track_id.store(0, Ordering::Release);
-                    self.engine.send(EngineCommand::Stop);
+                    self.engine.send(EngineCommand::DrainAndStop);
                 }
                 self.notify_playback();
             }
@@ -220,6 +232,9 @@ impl EndpointCore {
                 }
                 self.state.set_info_track(uri, metadata);
                 self.notify_receiver_and_info();
+                if let Some(n) = self.notifier.get() {
+                    n.notify_time();
+                }
             }
             EngineEvent::SongcastMetatext {
                 generation,
@@ -231,9 +246,15 @@ impl EndpointCore {
                 self.state.set_metatext(metatext);
                 self.notify_receiver_and_info();
             }
-            EngineEvent::Error { generation, .. } => {
+            EngineEvent::Error {
+                generation,
+                message,
+            } => {
                 if generation != self.current_generation() {
                     return;
+                }
+                if let Some(cb) = self.on_error.as_ref() {
+                    cb(&message);
                 }
                 self.loaded_track_id.store(0, Ordering::Release);
                 let _ = PlaylistService::stop(&self.state);
@@ -346,9 +367,17 @@ impl PlaylistService for EndpointCore {
                     self.load_current_track(false);
                 }
             }
-            TransportState::Stopped | TransportState::Paused => {
+            TransportState::Stopped => {
                 if new_id != prev_id {
                     self.stop_engine();
+                }
+            }
+            TransportState::Paused => {
+                if new_id != prev_id {
+                    self.stop_engine();
+                } else if new_id != 0 && self.loaded_track_id.load(Ordering::Acquire) == new_id {
+                    // Restarting track 0 while paused resets elapsed time to 0s; seek decoder too.
+                    self.engine.send(EngineCommand::Seek(0));
                 }
             }
         }
@@ -552,7 +581,9 @@ impl ReceiverService for EndpointCore {
                 interface: self.songcast_interface,
             });
         } else {
-            // Even without a sender URI, switching to Receiver stops any active Playlist audio.
+            // Even without a sender URI, switching to Receiver stops any active Playlist audio
+            // and must not leave ReceiverState stuck in Playing.
+            self.state.set_receiver_state(ReceiverState::Stopped);
             self.stop_engine();
         }
         Ok(())
@@ -566,6 +597,10 @@ impl ReceiverService for EndpointCore {
     }
 
     fn set_sender(&self, uri: String, metadata: String) -> ActionResult<()> {
+        if !uri.is_empty() {
+            SongcastUri::parse(&uri)
+                .map_err(|e| Fault::invalid_args(format!("Invalid Songcast sender URI: {e}")))?;
+        }
         let was_active = ReceiverService::transport_state(&self.state) != ReceiverState::Stopped;
         self.state.set_sender(uri.clone(), metadata)?;
         if was_active {
@@ -651,6 +686,7 @@ impl OpenHomeEndpoint {
             loaded_track_id: AtomicU32::new(0),
             songcast_interface: config.songcast_interface,
             allow_local_files: config.allow_local_files,
+            on_error: config.on_error,
             notifier: OnceLock::new(),
         });
 
@@ -716,14 +752,14 @@ impl OpenHomeEndpoint {
 
     /// Gracefully shut down the HTTP/SSDP server, event pump, and audio playback worker.
     pub async fn shutdown(mut self) {
+        if let Some(server) = self.server.take() {
+            server.shutdown().await;
+        }
         let _ = self.pump_stop_tx.send(true);
         if let Some(task) = self.pump_task.take() {
             let _ = task.await;
         }
         self.core.engine.shutdown_async().await;
-        if let Some(server) = self.server.take() {
-            server.shutdown().await;
-        }
     }
 }
 

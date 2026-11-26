@@ -61,6 +61,12 @@ impl PcmSpec {
         let ch = usize::from(self.channels.max(1));
         (interleaved_samples / ch) as u64
     }
+
+    /// True if two specs can share an already-open [`crate::SinkStream`] without reopening
+    /// hardware output (same sample rate and channel count; source bit depth is normalized to `f32`).
+    pub const fn is_sink_compatible(&self, other: &PcmSpec) -> bool {
+        self.sample_rate == other.sample_rate && self.channels == other.channels
+    }
 }
 
 /// One decoded or captured block of interleaved normalized `f32` PCM samples (`-1.0..=1.0`).
@@ -110,13 +116,14 @@ pub fn channel_gains(state: &VolumeLevel, chars: &VolumeCharacteristics) -> (f32
     }
 }
 
-/// Apply [`VolumeLevel`] in-place to interleaved `f32` samples (stateless convenience).
-pub fn apply_volume_in_place(samples: &mut [f32], channels: u16, state: &VolumeLevel) {
-    let chars = VolumeCharacteristics {
-        balance_max: if state.balance != 0 { 100 } else { 0 },
-        ..VolumeCharacteristics::default()
-    };
-    let (lg, rg) = channel_gains(state, &chars);
+/// Apply [`VolumeLevel`] in-place using explicit [`VolumeCharacteristics`].
+pub fn apply_volume_with_characteristics(
+    samples: &mut [f32],
+    channels: u16,
+    state: &VolumeLevel,
+    chars: &VolumeCharacteristics,
+) {
+    let (lg, rg) = channel_gains(state, chars);
     if lg == 0.0 && rg == 0.0 {
         samples.fill(0.0);
         return;
@@ -133,13 +140,29 @@ pub fn apply_volume_in_place(samples: &mut [f32], channels: u16, state: &VolumeL
     }
 }
 
+/// Apply [`VolumeLevel`] in-place to interleaved `f32` samples (stateless convenience).
+pub fn apply_volume_in_place(samples: &mut [f32], channels: u16, state: &VolumeLevel) {
+    let chars = VolumeCharacteristics {
+        balance_max: if state.balance != 0 { 100 } else { 0 },
+        ..VolumeCharacteristics::default()
+    };
+    apply_volume_with_characteristics(samples, channels, state, &chars);
+}
+
 /// Per-sample smooth gain ramp (~10 ms) eliminating zipper noise on volume/mute changes.
+///
+/// Persists ramp progress across successive calls to [`Self::apply`] so short blocks
+/// (e.g. 5 ms Songcast frames) ramp smoothly over the full 10 ms window.
 #[derive(Debug, Clone)]
 pub struct GainRamp {
     cur_left: f32,
     cur_right: f32,
     target_left: f32,
     target_right: f32,
+    ramp_start_left: f32,
+    ramp_start_right: f32,
+    ramp_pos: usize,
+    ramp_len: usize,
 }
 
 impl GainRamp {
@@ -150,22 +173,36 @@ impl GainRamp {
             cur_right: right,
             target_left: left,
             target_right: right,
+            ramp_start_left: left,
+            ramp_start_right: right,
+            ramp_pos: 0,
+            ramp_len: 0,
         }
     }
 
-    /// Update the target `(left, right)` linear gains (smoothly ramped on next audio block).
+    /// Update the target `(left, right)` linear gains (smoothly ramped across subsequent audio blocks).
     pub fn set_target(&mut self, left: f32, right: f32) {
-        self.target_left = left;
-        self.target_right = right;
+        if (self.target_left - left).abs() > 1e-6 || (self.target_right - right).abs() > 1e-6 {
+            self.target_left = left;
+            self.target_right = right;
+            self.ramp_start_left = self.cur_left;
+            self.ramp_start_right = self.cur_right;
+            self.ramp_pos = 0;
+            self.ramp_len = 0;
+        }
     }
 
-    /// Snap current and target gains immediately (used when idle/between tracks so muted
+    /// Snap current and target gains immediately (used when idle/paused so muted
     /// playback starts at exact silence without a 10 ms fade-down transient).
     pub fn snap_to(&mut self, left: f32, right: f32) {
         self.cur_left = left;
         self.cur_right = right;
         self.target_left = left;
         self.target_right = right;
+        self.ramp_start_left = left;
+        self.ramp_start_right = right;
+        self.ramp_pos = 0;
+        self.ramp_len = 0;
     }
 
     /// Apply smoothly ramped gain in-place to interleaved `samples` at `sample_rate`.
@@ -175,13 +212,14 @@ impl GainRamp {
         if frames == 0 {
             return;
         }
-        let ramp_frames = ((sample_rate / 100).max(1) as usize).min(frames);
         let needs_ramp = (self.cur_left - self.target_left).abs() > 1e-5
             || (self.cur_right - self.target_right).abs() > 1e-5;
 
         if !needs_ramp {
             self.cur_left = self.target_left;
             self.cur_right = self.target_right;
+            self.ramp_pos = 0;
+            self.ramp_len = 0;
             if self.cur_left == 0.0 && self.cur_right == 0.0 {
                 samples.fill(0.0);
                 return;
@@ -199,38 +237,51 @@ impl GainRamp {
             return;
         }
 
-        let start_l = self.cur_left;
-        let start_r = self.cur_right;
-        let inv = 1.0 / (ramp_frames as f32);
+        if self.ramp_len == 0 {
+            self.ramp_len = (sample_rate / 100).max(1) as usize;
+        }
+        let inv = 1.0 / (self.ramp_len as f32);
         for f in 0..frames {
-            let t = ((f + 1).min(ramp_frames) as f32) * inv;
-            let gl = start_l + (self.target_left - start_l) * t;
-            let gr = start_r + (self.target_right - start_r) * t;
+            if self.ramp_pos < self.ramp_len {
+                self.ramp_pos += 1;
+                let t = (self.ramp_pos as f32) * inv;
+                self.cur_left =
+                    self.ramp_start_left + (self.target_left - self.ramp_start_left) * t;
+                self.cur_right =
+                    self.ramp_start_right + (self.target_right - self.ramp_start_right) * t;
+            } else {
+                self.cur_left = self.target_left;
+                self.cur_right = self.target_right;
+            }
             let base = f * ch;
             if ch == 2 {
-                samples[base] *= gl;
-                samples[base + 1] *= gr;
+                samples[base] *= self.cur_left;
+                samples[base + 1] *= self.cur_right;
             } else {
                 for c in 0..ch {
-                    samples[base + c] *= gl;
+                    samples[base + c] *= self.cur_left;
                 }
             }
         }
-        self.cur_left = self.target_left;
-        self.cur_right = self.target_right;
+        if self.ramp_pos >= self.ramp_len {
+            self.cur_left = self.target_left;
+            self.cur_right = self.target_right;
+            self.ramp_pos = 0;
+            self.ramp_len = 0;
+        }
     }
 }
 
-/// Convert big-endian signed integer Songcast PCM bytes (`bit_depth` of `16`, `24`, or `32`)
+/// Convert big-endian signed integer PCM bytes (`bit_depth` of `16`, `24`, or `32`)
 /// into interleaved normalized `f32` samples in `-1.0..=1.0`.
-pub fn songcast_pcm_be_to_f32(bytes: &[u8], bit_depth: u8) -> Vec<f32> {
+pub fn pcm_be_to_f32(bytes: &[u8], bit_depth: u8) -> Vec<f32> {
     let mut out = Vec::new();
-    songcast_pcm_be_into_f32(bytes, bit_depth, &mut out);
+    pcm_be_into_f32(bytes, bit_depth, &mut out);
     out
 }
 
-/// Convert big-endian signed integer Songcast PCM bytes into `out` (reusing its allocation).
-pub fn songcast_pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>) {
+/// Convert big-endian signed integer PCM bytes into `out` (reusing its allocation).
+pub fn pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>) {
     out.clear();
     match bit_depth {
         16 => {
@@ -261,6 +312,16 @@ pub fn songcast_pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>)
         }
         _ => {}
     }
+}
+
+/// Alias for [`pcm_be_to_f32`] retained for Songcast callers.
+pub fn songcast_pcm_be_to_f32(bytes: &[u8], bit_depth: u8) -> Vec<f32> {
+    pcm_be_to_f32(bytes, bit_depth)
+}
+
+/// Alias for [`pcm_be_into_f32`] retained for Songcast callers.
+pub fn songcast_pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>) {
+    pcm_be_into_f32(bytes, bit_depth, out);
 }
 
 /// Lock-free single-producer, single-consumer `f32` ring buffer built with safe atomics
@@ -364,7 +425,8 @@ impl SpscRingBuffer {
         let r = self.read_idx.load(Ordering::Relaxed);
         let w = self.write_idx.load(Ordering::Acquire);
         let avail = if w >= r { w - r } else { self.mask_len - r + w };
-        let count = avail.min(out.len());
+        // Always pop whole channel-aligned frames so L/R channels can never rotate.
+        let count = (avail.min(out.len()) / self.channels) * self.channels;
         let mut pos = r;
         for slot in &mut out[..count] {
             *slot = f32::from_bits(self.buf[pos].load(Ordering::Relaxed));
@@ -398,6 +460,7 @@ pub struct PcmAdapter {
     phase: f64,
     prev_frame: Vec<f32>,
     has_prev: bool,
+    remix_scratch: Vec<f32>,
 }
 
 impl PcmAdapter {
@@ -412,6 +475,7 @@ impl PcmAdapter {
             phase: 0.0,
             prev_frame: vec![0.0; out_ch],
             has_prev: false,
+            remix_scratch: Vec::new(),
         }
     }
 
@@ -439,45 +503,51 @@ impl PcmAdapter {
             return;
         }
 
-        // Step 1: remix channels into a scratch buffer at `in_rate`.
-        let mut remixed = Vec::with_capacity(in_frames * self.out_channels);
-        for f in 0..in_frames {
-            let frame = &input[f * self.in_channels..(f + 1) * self.in_channels];
-            match (self.in_channels, self.out_channels) {
-                (ic, oc) if ic == oc => remixed.extend_from_slice(frame),
-                (1, oc) => {
-                    for _ in 0..oc {
-                        remixed.push(frame[0]);
+        // Step 1: remix channels into reusable scratch (bypassed when channel counts match).
+        let src: &[f32] = if self.in_channels == self.out_channels {
+            &input[..in_frames * self.in_channels]
+        } else {
+            self.remix_scratch.clear();
+            self.remix_scratch.reserve(in_frames * self.out_channels);
+            for f in 0..in_frames {
+                let frame = &input[f * self.in_channels..(f + 1) * self.in_channels];
+                match (self.in_channels, self.out_channels) {
+                    (1, oc) => {
+                        for _ in 0..oc {
+                            self.remix_scratch.push(frame[0]);
+                        }
                     }
-                }
-                (ic, 1) => {
-                    let sum: f32 = frame.iter().copied().sum();
-                    remixed.push(sum / (ic as f32));
-                }
-                (ic, 2) => {
-                    // Fold multichannel (e.g. 5.1) into stereo (FL/FR + center/surround fold).
-                    let l = frame[0];
-                    let r = frame[1];
-                    let extra = if ic > 2 {
-                        frame[2..].iter().copied().sum::<f32>() / ((ic - 2) as f32) * 0.5
-                    } else {
-                        0.0
-                    };
-                    remixed.push((l + extra).clamp(-1.0, 1.0));
-                    remixed.push((r + extra).clamp(-1.0, 1.0));
-                }
-                (ic, oc) => {
-                    let copy = ic.min(oc);
-                    remixed.extend_from_slice(&frame[..copy]);
-                    if oc > copy {
-                        remixed.resize(remixed.len() + (oc - copy), 0.0);
+                    (ic, 1) => {
+                        let sum: f32 = frame.iter().copied().sum();
+                        self.remix_scratch.push(sum / (ic as f32));
+                    }
+                    (ic, 2) => {
+                        // Fold multichannel (e.g. 5.1) into stereo (FL/FR + center/surround fold).
+                        let l = frame[0];
+                        let r = frame[1];
+                        let extra = if ic > 2 {
+                            frame[2..].iter().copied().sum::<f32>() / ((ic - 2) as f32) * 0.5
+                        } else {
+                            0.0
+                        };
+                        self.remix_scratch.push((l + extra).clamp(-1.0, 1.0));
+                        self.remix_scratch.push((r + extra).clamp(-1.0, 1.0));
+                    }
+                    (ic, oc) => {
+                        let copy = ic.min(oc);
+                        self.remix_scratch.extend_from_slice(&frame[..copy]);
+                        if oc > copy {
+                            self.remix_scratch
+                                .resize(self.remix_scratch.len() + (oc - copy), 0.0);
+                        }
                     }
                 }
             }
-        }
+            &self.remix_scratch
+        };
 
         if self.in_rate == self.out_rate {
-            out.extend_from_slice(&remixed);
+            out.extend_from_slice(src);
             return;
         }
 
@@ -485,7 +555,7 @@ impl PcmAdapter {
         let ratio = (self.in_rate as f64) / (self.out_rate as f64);
         let oc = self.out_channels;
         if !self.has_prev {
-            self.prev_frame.copy_from_slice(&remixed[..oc]);
+            self.prev_frame.copy_from_slice(&src[..oc]);
             self.has_prev = true;
         }
 
@@ -496,10 +566,10 @@ impl PcmAdapter {
                 &self.prev_frame[..]
             } else {
                 let p = ((idx - 1) as usize).min(in_frames - 1) * oc;
-                &remixed[p..p + oc]
+                &src[p..p + oc]
             };
             let b_idx = (idx.max(0) as usize).min(in_frames - 1) * oc;
-            let b = &remixed[b_idx..b_idx + oc];
+            let b = &src[b_idx..b_idx + oc];
             for c in 0..oc {
                 out.push(a[c] + (b[c] - a[c]) * frac);
             }
@@ -507,7 +577,7 @@ impl PcmAdapter {
         }
         self.phase -= in_frames as f64;
         let last = (in_frames - 1) * oc;
-        self.prev_frame.copy_from_slice(&remixed[last..last + oc]);
+        self.prev_frame.copy_from_slice(&src[last..last + oc]);
     }
 }
 
@@ -546,6 +616,29 @@ mod tests {
         let mut steady = vec![0.5f32; 8];
         ramp.apply(&mut steady, 2, 10_000);
         assert!((steady[0] - 0.5).abs() < 1e-6);
+
+        // Multi-block smooth ramping on 5 ms Songcast frames (220 frames @ 44.1 kHz < 441-frame 10ms ramp).
+        let mut sc_ramp = GainRamp::new(0.0, 0.0);
+        sc_ramp.set_target(1.0, 1.0);
+        let mut b1 = vec![1.0f32; 220 * 2];
+        sc_ramp.apply(&mut b1, 2, 44_100);
+        // After 220/441 frames (~50%), gain must NOT have snapped to 1.0 yet.
+        assert!(b1[438] > 0.45 && b1[438] < 0.55, "b1 end={}", b1[438]);
+        let mut b2 = vec![1.0f32; 220 * 2];
+        sc_ramp.apply(&mut b2, 2, 44_100);
+        assert!(
+            b2[0] > b1[438],
+            "ramp must continue monotonically across blocks"
+        );
+        let mut b3 = vec![1.0f32; 20 * 2];
+        sc_ramp.apply(&mut b3, 2, 44_100);
+        assert!((b3[38] - 1.0).abs() < 1e-5);
+
+        // PcmSpec::is_sink_compatible ignores source bit depth.
+        assert!(PcmSpec::new(44_100, 2, 16).is_sink_compatible(&PcmSpec::new(44_100, 2, 24)));
+        assert!(PcmSpec::new(44_100, 2, 16).is_sink_compatible(&PcmSpec::new(44_100, 2, 0)));
+        assert!(!PcmSpec::new(44_100, 2, 16).is_sink_compatible(&PcmSpec::new(48_000, 2, 16)));
+        assert!(!PcmSpec::new(44_100, 2, 16).is_sink_compatible(&PcmSpec::new(44_100, 1, 16)));
     }
 
     #[test]
@@ -580,16 +673,20 @@ mod tests {
         assert_eq!(rb.push(&[10.0, 11.0, 12.0, 13.0, 14.0, 15.0]), 6);
         assert_eq!(rb.push(&[1.0; 6]), 0); // full
 
-        let mut out = vec![0.0f32; 8];
-        assert_eq!(rb.pop_into(&mut out), 8);
-        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 11.0]);
+        // Non-aligned slice (8 samples on 6-channel ring) pops only 1 whole frame (6 samples)
+        // and zero-fills the trailing 2 samples so channel alignment is never rotated.
+        let mut out = vec![9.0f32; 8];
+        assert_eq!(rb.pop_into(&mut out), 6);
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0]);
 
         // Wraparound push & pop + underrun zero-fill
         assert_eq!(rb.push(&[20.0, 21.0, 22.0, 23.0, 24.0, 25.0]), 6);
-        let mut tail = vec![9.0f32; 12];
-        assert_eq!(rb.pop_into(&mut tail), 10);
-        assert_eq!(tail[10], 0.0);
-        assert_eq!(tail[11], 0.0);
+        let mut tail = vec![9.0f32; 14];
+        assert_eq!(rb.pop_into(&mut tail), 12);
+        assert_eq!(tail[0], 10.0);
+        assert_eq!(tail[6], 20.0);
+        assert_eq!(tail[12], 0.0);
+        assert_eq!(tail[13], 0.0);
 
         rb.push(&[1.0; 6]);
         rb.clear();

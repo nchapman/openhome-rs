@@ -3,8 +3,8 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use symphonia::core::audio::SampleBuffer;
@@ -22,10 +22,31 @@ use symphonia::core::units::{Time, TimeBase};
 use crate::error::AudioError;
 use crate::format::PcmSpec;
 
-/// Maximum buffered HTTP audio payload size when fetching finite tracks (256 MiB).
-const MAX_HTTP_FETCH_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum buffered HTTP audio payload size when the server does not support `Accept-Ranges: bytes` (64 MiB).
+const MAX_HTTP_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum forward seek distance satisfied by discarding from the current HTTP stream instead of issuing a new `Range` request.
+const RANGE_SKIP_THRESHOLD: u64 = 16 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONSECUTIVE_RESETS: usize = 16;
+const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 64;
+const MAX_SKIPPED_PACKETS: usize = 4096;
+
+/// Shared HTTP agent so TLS root certificates and keep-alive pools are reused across tracks.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        // Use per-phase and per-read timeouts (NOT timeout_global) so live radio and long
+        // streams play indefinitely while stalled connections still time out cleanly.
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+            .timeout_send_request(Some(HTTP_CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(HTTP_IO_TIMEOUT))
+            .timeout_per_read(Some(HTTP_IO_TIMEOUT))
+            .build()
+            .new_agent()
+    })
+}
 
 /// Returns `true` if `uri` uses an `http://` or `https://` scheme (case-insensitive).
 pub fn is_http_uri(uri: &str) -> bool {
@@ -107,6 +128,8 @@ pub struct DecodedStream {
     duration_secs: u32,
     bit_rate: u32,
     codec_info: CodecInfo,
+    seekable: bool,
+    cancel: Option<LoadCancel>,
     sample_buf: Option<SampleBuffer<f32>>,
     last_buf_spec: Option<(u32, usize)>,
 }
@@ -143,11 +166,13 @@ impl DecodedStream {
         allow_local_files: bool,
         cancel: Option<LoadCancel>,
     ) -> Result<Self, AudioError> {
+        let uri = uri.trim();
         let OpenedSource {
             source,
             hint,
             byte_len,
-        } = open_media_source(uri, allow_local_files, cancel)?;
+            seekable,
+        } = open_media_source(uri, allow_local_files, cancel.clone())?;
         let mss = MediaSourceStream::new(source, Default::default());
 
         let probed = symphonia::default::get_probe()
@@ -179,7 +204,8 @@ impl DecodedStream {
         let codec_info = classify_codec(params.codec);
         let sample_rate = params
             .sample_rate
-            .ok_or_else(|| AudioError::Decode("missing sample rate".into()))?;
+            .filter(|&r| r > 0)
+            .ok_or_else(|| AudioError::Decode("missing or zero sample rate".into()))?;
         let channels = params
             .channels
             .map(|c| c.count() as u16)
@@ -196,15 +222,17 @@ impl DecodedStream {
 
         let time_base = params
             .time_base
-            .unwrap_or_else(|| TimeBase::new(1, sample_rate.max(1)));
+            .unwrap_or_else(|| TimeBase::new(1, sample_rate));
         let start_ts = params.start_ts;
         let duration_secs = params
             .n_frames
-            .map(|frames| time_base.calc_time(frames).seconds as u32)
+            .map(|frames| u32::try_from(time_base.calc_time(frames).seconds).unwrap_or(u32::MAX))
             .unwrap_or(0);
 
         let bit_rate = match (byte_len, duration_secs) {
-            (Some(bytes), dur) if dur > 0 => ((bytes.saturating_mul(8)) / u64::from(dur)) as u32,
+            (Some(bytes), dur) if dur > 0 => {
+                u32::try_from(bytes.saturating_mul(8) / u64::from(dur)).unwrap_or(u32::MAX)
+            }
             _ if codec_info.lossless => sample_rate
                 .saturating_mul(u32::from(channels))
                 .saturating_mul(u32::from(bits_per_sample.max(16))),
@@ -225,6 +253,8 @@ impl DecodedStream {
             duration_secs,
             bit_rate,
             codec_info,
+            seekable,
+            cancel,
             sample_buf: None,
             last_buf_spec: None,
         })
@@ -255,6 +285,11 @@ impl DecodedStream {
         self.codec_info.lossless
     }
 
+    /// Whether the underlying media source supports seeking.
+    pub fn is_seekable(&self) -> bool {
+        self.seekable
+    }
+
     /// Seek to `seconds` from the start of the track using the stream's [`TimeBase`].
     pub fn seek(&mut self, seconds: u32) -> Result<u32, AudioError> {
         let seeked = self
@@ -279,7 +314,15 @@ impl DecodedStream {
     /// Updates [`DecodedStream::spec`] if the decoded frame's sample rate or channel count changed.
     pub fn next_frame_into(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         out.clear();
+        let mut consecutive_resets = 0usize;
+        let mut consecutive_decode_errors = 0usize;
+        let mut skipped_packets = 0usize;
+
         loop {
+            if self.cancel.as_ref().is_some_and(LoadCancel::is_cancelled) {
+                return Err(AudioError::Source("track decode cancelled".into()));
+            }
+
             let packet = match self.format.next_packet() {
                 Ok(p) => p,
                 Err(SymphError::IoError(err))
@@ -288,6 +331,12 @@ impl DecodedStream {
                     return Ok(false);
                 }
                 Err(SymphError::ResetRequired) => {
+                    consecutive_resets += 1;
+                    if consecutive_resets > MAX_CONSECUTIVE_RESETS {
+                        return Err(AudioError::Decode(
+                            "too many consecutive decoder resets".into(),
+                        ));
+                    }
                     self.decoder.reset();
                     continue;
                 }
@@ -295,12 +344,26 @@ impl DecodedStream {
             };
 
             if packet.track_id() != self.track_id {
+                skipped_packets += 1;
+                if skipped_packets > MAX_SKIPPED_PACKETS {
+                    return Err(AudioError::Decode(
+                        "too many non-audio packets without audio data".into(),
+                    ));
+                }
                 continue;
             }
 
             let decoded = match self.decoder.decode(&packet) {
                 Ok(buf) => buf,
-                Err(SymphError::DecodeError(_)) => continue,
+                Err(SymphError::DecodeError(msg)) => {
+                    consecutive_decode_errors += 1;
+                    if consecutive_decode_errors > MAX_CONSECUTIVE_DECODE_ERRORS {
+                        return Err(AudioError::Decode(format!(
+                            "too many consecutive decode errors: {msg}"
+                        )));
+                    }
+                    continue;
+                }
                 Err(SymphError::IoError(err))
                     if err.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -311,6 +374,12 @@ impl DecodedStream {
 
             let frames = decoded.frames();
             if frames == 0 {
+                skipped_packets += 1;
+                if skipped_packets > MAX_SKIPPED_PACKETS {
+                    return Err(AudioError::Decode(
+                        "too many empty decoded audio frames".into(),
+                    ));
+                }
                 continue;
             }
 
@@ -401,10 +470,193 @@ impl MediaSource for StreamingHttpSource {
     }
 }
 
+/// Seekable HTTP `MediaSource` backed by HTTP `Range: bytes=...` requests.
+///
+/// Streams directly from the initial `GET` response with O(1) RAM (no full-track download),
+/// and issues `Range` requests on demand when Symphonia probes container trailers or seeks.
+struct HttpRangeStream {
+    uri: String,
+    byte_len: u64,
+    pos: u64,
+    reader: Option<Box<dyn Read + Send + Sync>>,
+    cancel: Option<LoadCancel>,
+}
+
+impl HttpRangeStream {
+    fn open_range(&mut self) -> std::io::Result<()> {
+        if self.cancel.as_ref().is_some_and(LoadCancel::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "track load cancelled",
+            ));
+        }
+        let resp = http_agent()
+            .get(&self.uri)
+            .header("Range", &format!("bytes={}-", self.pos))
+            .call()
+            .map_err(|e| std::io::Error::other(format!("HTTP Range GET failed: {e}")))?;
+        let status = resp.status().as_u16();
+        if status == 206 || (status == 200 && self.pos == 0) {
+            self.reader = Some(Box::new(CancellableReader {
+                inner: resp.into_body().into_reader(),
+                cancel: self.cancel.clone(),
+            }));
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("HTTP Range request returned status {status}"),
+            ))
+        }
+    }
+}
+
+impl Read for HttpRangeStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.as_ref().is_some_and(LoadCancel::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "track load cancelled",
+            ));
+        }
+        if self.pos >= self.byte_len || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.reader.is_none() {
+            self.open_range()?;
+        }
+        let n = self.reader.as_mut().unwrap().read(buf)?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+impl Seek for HttpRangeStream {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::End(off) => i128::from(self.byte_len) + i128::from(off),
+            SeekFrom::Current(off) => i128::from(self.pos) + i128::from(off),
+        };
+        if target < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        let target = (target as u64).min(self.byte_len);
+        if target == self.pos {
+            return Ok(self.pos);
+        }
+
+        // Satisfy small forward seeks by draining the active stream to avoid a new HTTP round-trip.
+        if target > self.pos
+            && target - self.pos <= RANGE_SKIP_THRESHOLD
+            && let Some(reader) = self.reader.as_mut()
+        {
+            let mut remaining = (target - self.pos) as usize;
+            let mut discard = [0u8; 4096];
+            while remaining > 0 {
+                let want = remaining.min(discard.len());
+                let n = reader.read(&mut discard[..want])?;
+                if n == 0 {
+                    break;
+                }
+                self.pos += n as u64;
+                remaining -= n;
+            }
+            if self.pos == target {
+                return Ok(self.pos);
+            }
+        }
+
+        self.reader = None;
+        self.pos = target;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for HttpRangeStream {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.byte_len)
+    }
+}
+
 struct OpenedSource {
     source: Box<dyn MediaSource>,
     hint: Hint,
     byte_len: Option<u64>,
+    seekable: bool,
+}
+
+/// Extract a file-extension hint strictly from the path component of a URI or filesystem path,
+/// ignoring authority/domain TLDs (e.g. `http://server.local`), `?query`, and `#fragment`.
+fn extract_extension_hint(uri: &str) -> Option<&str> {
+    let without_frag = uri.split(['?', '#']).next().unwrap_or(uri);
+    let path_only = if is_http_uri(without_frag) {
+        let after_scheme = without_frag
+            .find("://")
+            .map(|i| &without_frag[i + 3..])
+            .unwrap_or("");
+        after_scheme.find('/').map(|i| &after_scheme[i..])?
+    } else {
+        without_frag
+    };
+    Path::new(path_only).extension().and_then(|e| e.to_str())
+}
+
+/// Parse a `file://` URI (case-insensitive, handling `file://localhost/...` and `%XX` escapes)
+/// or bare filesystem path into a local path string.
+fn parse_local_path(uri: &str) -> String {
+    let stripped = if uri
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("file://"))
+    {
+        let rest = &uri[7..];
+        if rest
+            .get(..10)
+            .is_some_and(|s| s.eq_ignore_ascii_case("localhost/"))
+        {
+            &rest[9..]
+        } else {
+            rest
+        }
+    } else {
+        return uri.to_string();
+    };
+    percent_decode(stripped)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn open_media_source(
@@ -417,22 +669,12 @@ fn open_media_source(
     }
 
     let mut hint = Hint::new();
-    let path_part = uri.split('?').next().unwrap_or(uri);
-    if let Some(ext) = Path::new(path_part).extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = extract_extension_hint(uri) {
         hint.with_extension(ext);
     }
 
     if is_http_uri(uri) {
-        // Use per-phase and per-read timeouts (NOT timeout_global) so live radio and long
-        // streams play indefinitely while stalled connections still time out cleanly.
-        let agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
-            .timeout_send_request(Some(HTTP_CONNECT_TIMEOUT))
-            .timeout_recv_response(Some(HTTP_IO_TIMEOUT))
-            .timeout_per_read(Some(HTTP_IO_TIMEOUT))
-            .build()
-            .new_agent();
-        let resp = agent
+        let resp = http_agent()
             .get(uri)
             .call()
             .map_err(|e| AudioError::Source(format!("HTTP GET {uri} failed: {e}")))?;
@@ -442,6 +684,12 @@ fn open_media_source(
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+
+        let accepts_ranges = resp
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
 
         if let Some(ct) = resp
             .headers()
@@ -454,19 +702,37 @@ fn open_media_source(
             }
         }
 
-        // For finite tracks within budget, buffer into a seekable Cursor so Symphonia can
-        // probe container trailers (MP4/FLAC/WAV) and support instant SeekSecondAbsolute.
-        // Cap initial pre-allocation to 1 MiB so an untrusted Content-Length cannot force an
-        // immediate 256 MiB allocation before any body bytes arrive.
+        // Preferred path: Range-capable HTTP server -> stream immediately with O(1) RAM
+        // and full random-access seeking for arbitrarily large hi-res tracks.
+        if accepts_ranges && let Some(len) = content_len.filter(|&l| l > 0) {
+            let reader: Box<dyn Read + Send + Sync> = Box::new(CancellableReader {
+                inner: resp.into_body().into_reader(),
+                cancel: cancel.clone(),
+            });
+            return Ok(OpenedSource {
+                source: Box::new(HttpRangeStream {
+                    uri: uri.to_string(),
+                    byte_len: len,
+                    pos: 0,
+                    reader: Some(reader),
+                    cancel,
+                }),
+                hint,
+                byte_len: Some(len),
+                seekable: true,
+            });
+        }
+
+        // Fallback for small finite tracks on servers that do not advertise Accept-Ranges:
+        // buffer into a seekable Cursor (capping initial pre-allocation to 1 MiB).
         if let Some(len) = content_len
             && len <= MAX_HTTP_FETCH_BYTES
         {
             let mut data = Vec::with_capacity(len.min(1024 * 1024) as usize);
-            let reader = CancellableReader {
+            let mut reader = CancellableReader {
                 inner: resp.into_body().into_reader().take(MAX_HTTP_FETCH_BYTES),
                 cancel,
             };
-            let mut reader = reader;
             reader
                 .read_to_end(&mut data)
                 .map_err(|e| AudioError::Source(format!("HTTP read {uri} failed: {e}")))?;
@@ -475,6 +741,7 @@ fn open_media_source(
                 source: Box::new(Cursor::new(data)),
                 hint,
                 byte_len: Some(actual_len),
+                seekable: true,
             });
         }
 
@@ -490,6 +757,7 @@ fn open_media_source(
             }),
             hint,
             byte_len: content_len,
+            seekable: false,
         });
     }
 
@@ -499,14 +767,15 @@ fn open_media_source(
         )));
     }
 
-    let local_path = uri.strip_prefix("file://").unwrap_or(uri);
-    let file = File::open(local_path)
+    let local_path = parse_local_path(uri);
+    let file = File::open(&local_path)
         .map_err(|e| AudioError::Source(format!("cannot open {local_path}: {e}")))?;
     let byte_len = file.metadata().ok().map(|m| m.len());
     Ok(OpenedSource {
         source: Box::new(file),
         hint,
         byte_len,
+        seekable: true,
     })
 }
 
@@ -600,5 +869,131 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn http_range_stream_supports_streaming_seek_and_uri_helpers() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // URI extension hint and file:// parsing edge cases.
+        assert_eq!(extract_extension_hint("http://server.local"), None);
+        assert_eq!(
+            extract_extension_hint("http://server.local/music/track.flac?token=1#frag"),
+            Some("flac")
+        );
+        assert_eq!(
+            parse_local_path("FILE://localhost/tmp/my%20track%2b1%ZZ.wav"),
+            "/tmp/my track+1%ZZ.wav"
+        );
+        assert_eq!(
+            parse_local_path("file:///tmp/my%20file.wav"),
+            "/tmp/my file.wav"
+        );
+        assert_eq!(parse_local_path("/tmp/plain.wav"), "/tmp/plain.wav");
+
+        // Direct HttpRangeStream SeekFrom::Start / Current / End / negative / small-skip coverage.
+        let mut range_stream = HttpRangeStream {
+            uri: "http://127.0.0.1:1/x".into(),
+            byte_len: 100,
+            pos: 0,
+            reader: Some(Box::new(Cursor::new(vec![42u8; 100]))),
+            cancel: None,
+        };
+        assert!(range_stream.is_seekable());
+        assert_eq!(range_stream.byte_len(), Some(100));
+        // Small forward seek (<= 16 KiB) skips by draining active reader without HTTP round-trip.
+        assert_eq!(range_stream.seek(SeekFrom::Start(10)).unwrap(), 10);
+        assert_eq!(range_stream.seek(SeekFrom::Current(5)).unwrap(), 15);
+        assert_eq!(range_stream.stream_position().unwrap(), 15);
+        assert_eq!(range_stream.seek(SeekFrom::End(-10)).unwrap(), 90);
+        assert!(range_stream.seek(SeekFrom::Start(0)).is_ok());
+        assert!(range_stream.seek(SeekFrom::Current(-1)).is_err());
+        let mut one = [0u8; 1];
+        range_stream.pos = 100;
+        assert_eq!(range_stream.read(&mut one).unwrap(), 0);
+
+        // Spin up a tiny Range-capable HTTP/1.1 server serving a 2-second WAV.
+        let wav = Arc::new(synth_wav(44_100, 44_100 * 2));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wav_srv = Arc::clone(&wav);
+        let srv_handle = std::thread::spawn(move || {
+            // Serve up to 4 requests (initial GET + Range seeks).
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let range_start = req.lines().find_map(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("range: bytes=")
+                        .and_then(|r| r.split('-').next())
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                });
+                if let Some(start) = range_start {
+                    let start = start.min(wav_srv.len());
+                    let slice = &wav_srv[start..];
+                    let hdr = format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         Content-Type: audio/wav\r\n\
+                         Accept-Ranges: bytes\r\n\
+                         Content-Range: bytes {start}-{}/{}\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        wav_srv.len().saturating_sub(1),
+                        wav_srv.len(),
+                        slice.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(slice);
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: audio/wav\r\n\
+                         Accept-Ranges: bytes\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        wav_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&wav_srv);
+                }
+            }
+        });
+
+        let uri = format!("  http://{addr}/song.wav?x=1#top  ");
+        let latest = Arc::new(AtomicU64::new(1));
+        let mut stream = DecodedStream::open_with_options(
+            &uri,
+            false,
+            Some(LoadCancel::new(1, Arc::clone(&latest))),
+        )
+        .unwrap();
+        assert!(stream.is_seekable());
+        assert_eq!(stream.duration_secs(), 2);
+
+        let first = stream.next_frame().unwrap().expect("first frame");
+        assert!(!first.is_empty());
+
+        // Seek forward triggers HTTP 206 Range request.
+        let seeked = stream.seek(1).unwrap();
+        assert!(seeked <= 1);
+        let after_seek = stream.next_frame().unwrap().expect("frame after seek");
+        assert!(!after_seek.is_empty());
+
+        // Mid-stream cancellation aborts next_frame cleanly.
+        latest.store(2, Ordering::Release);
+        assert!(stream.next_frame().is_err());
+
+        drop(stream);
+        // Unblock listener if fewer than 4 requests were made.
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = srv_handle.join();
     }
 }

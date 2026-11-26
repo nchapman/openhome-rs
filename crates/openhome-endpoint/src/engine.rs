@@ -10,7 +10,7 @@ use std::time::Duration;
 use openhome_audio::{
     AudioSink, DecodedStream, GainRamp, LoadCancel, PcmSpec, SinkStream,
     VolumeCharacteristics as AudioVolumeChars, VolumeLevel, channel_gains as audio_channel_gains,
-    songcast_pcm_be_into_f32,
+    pcm_be_into_f32,
 };
 use openhome_core::types::{
     ReceiverState, TrackDetails, TransportState, VolumeCharacteristics, VolumeState,
@@ -46,8 +46,10 @@ pub enum EngineCommand {
     Play,
     /// Pause playback and flush the output sink.
     Pause,
-    /// Stop playback and close the active track / Songcast stream.
+    /// Stop playback immediately, flushing and closing any active track / Songcast stream.
     Stop,
+    /// Drain any buffered audio at end-of-playlist before closing the sink cleanly.
+    DrainAndStop,
     /// Seek the active track to `seconds` from start.
     Seek(u32),
     /// Update live volume/mute/balance gain.
@@ -102,6 +104,7 @@ pub enum EngineEvent {
 pub struct PlaybackEngine {
     cmd_tx: Sender<EngineCommand>,
     latest_generation: Arc<AtomicU64>,
+    owned_generation: bool,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -117,13 +120,15 @@ impl PlaybackEngine {
         sink: Arc<dyn AudioSink>,
         runtime: tokio::runtime::Handle,
     ) -> (Self, tokio_mpsc::UnboundedReceiver<EngineEvent>) {
-        Self::spawn_with_options(
+        let (mut engine, rx) = Self::spawn_with_options(
             sink,
             runtime,
             Arc::new(AtomicU64::new(0)),
             false,
             VolumeCharacteristics::default(),
-        )
+        );
+        engine.owned_generation = true;
+        (engine, rx)
     }
 
     /// Spawn the playback worker with shared generation counter, local-file policy, and volume characteristics.
@@ -155,6 +160,7 @@ impl PlaybackEngine {
             Self {
                 cmd_tx,
                 latest_generation,
+                owned_generation: false,
                 worker: Mutex::new(Some(worker)),
             },
             ev_rx,
@@ -163,10 +169,18 @@ impl PlaybackEngine {
 
     /// Send a non-blocking command to the playback worker.
     pub fn send(&self, cmd: EngineCommand) {
+        if self.owned_generation
+            && let EngineCommand::Load { generation, .. }
+            | EngineCommand::StartSongcast { generation, .. } = &cmd
+        {
+            self.latest_generation.store(*generation, Ordering::Release);
+        }
         let _ = self.cmd_tx.send(cmd);
     }
 
     /// Synchronously shut down and join the playback worker thread.
+    ///
+    /// Do not call from a Tokio runtime thread; use [`Self::shutdown_async`] instead.
     pub fn shutdown(self) {
         self.latest_generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.cmd_tx.send(EngineCommand::Shutdown);
@@ -210,6 +224,7 @@ struct ActiveSongcast {
     receiver: SongcastReceiver,
     sink: Option<Box<dyn SinkStream>>,
     last_spec: Option<PcmSpec>,
+    last_details: Option<TrackDetails>,
     playing: bool,
     last_reported_sec: u32,
 }
@@ -242,6 +257,7 @@ fn worker_loop(
     let (init_l, init_r) = channel_gains(&default_vol, &volume_chars);
     let mut gain_ramp = GainRamp::new(init_l, init_r);
     let mut track: Option<ActiveTrack> = None;
+    let mut idle_sink: Option<Box<dyn SinkStream>> = None;
     let mut songcast: Option<ActiveSongcast> = None;
     let mut pcm_scratch: Vec<f32> = Vec::with_capacity(8192);
 
@@ -264,6 +280,7 @@ fn worker_loop(
             match cmd {
                 EngineCommand::Shutdown => {
                     drop(track);
+                    drop(idle_sink);
                     if let Some(sc) = songcast.take() {
                         shutdown_songcast_nonblocking(&runtime, sc);
                     }
@@ -271,7 +288,7 @@ fn worker_loop(
                 }
                 EngineCommand::SetVolume(v) => {
                     let (lg, rg) = channel_gains(&v, &volume_chars);
-                    if track.is_none() && songcast.is_none() {
+                    if track.as_ref().is_none_or(|t| t.paused) && songcast.is_none() {
                         gain_ramp.snap_to(lg, rg);
                     } else {
                         gain_ramp.set_target(lg, rg);
@@ -280,6 +297,20 @@ fn worker_loop(
                 EngineCommand::Stop => {
                     if let Some(mut t) = track.take() {
                         t.sink.flush();
+                    }
+                    if let Some(mut s) = idle_sink.take() {
+                        s.flush();
+                    }
+                    if let Some(sc) = songcast.take() {
+                        shutdown_songcast_nonblocking(&runtime, sc);
+                    }
+                }
+                EngineCommand::DrainAndStop => {
+                    if let Some(mut t) = track.take() {
+                        t.sink.drain();
+                    }
+                    if let Some(mut s) = idle_sink.take() {
+                        s.drain();
                     }
                     if let Some(sc) = songcast.take() {
                         shutdown_songcast_nonblocking(&runtime, sc);
@@ -347,8 +378,19 @@ fn worker_loop(
                         shutdown_songcast_nonblocking(&runtime, sc);
                     }
 
-                    // Preserve the open sink for gapless reuse if the next track matches PcmSpec.
-                    let mut reusable_sink = track.take().map(|t| t.sink);
+                    // Preserve an open sink for gapless reuse if the next track has a compatible
+                    // (sample_rate, channels) format:
+                    // - Manual skip (track was active): flush immediately so old audio does not bleed.
+                    // - Natural EOF (idle_sink): do NOT flush so queued tail plays out gaplessly.
+                    let (mut reusable_sink, was_gapless) = if let Some(mut old) = track.take() {
+                        old.sink.flush();
+                        drop(idle_sink.take());
+                        (Some(old.sink), false)
+                    } else if let Some(s) = idle_sink.take() {
+                        (Some(s), true)
+                    } else {
+                        (None, false)
+                    };
 
                     let _ = ev_tx.send(EngineEvent::StateChanged {
                         generation,
@@ -365,9 +407,13 @@ fn worker_loop(
                         Ok(stream) => {
                             let spec = stream.spec();
                             let sink_res = match reusable_sink.take() {
-                                Some(s) if s.spec() == spec => Ok(s),
-                                Some(old) => {
-                                    // Drop old sink BEFORE opening the new one to avoid EBUSY.
+                                Some(s) if s.spec().is_sink_compatible(&spec) => Ok(s),
+                                Some(mut old) => {
+                                    // On gapless format change, drain the previous track's tail
+                                    // before dropping and reopening the hardware stream (avoids EBUSY).
+                                    if was_gapless {
+                                        old.drain();
+                                    }
                                     drop(old);
                                     sink_factory.open(spec)
                                 }
@@ -416,7 +462,11 @@ fn worker_loop(
                             }
                         }
                         Err(err) => {
-                            drop(reusable_sink);
+                            if let Some(mut old) = reusable_sink.take()
+                                && was_gapless
+                            {
+                                old.drain();
+                            }
                             let _ = ev_tx.send(EngineEvent::Error {
                                 generation,
                                 message: err.to_string(),
@@ -435,6 +485,7 @@ fn worker_loop(
                     }
 
                     track = None;
+                    drop(idle_sink.take());
                     if let Some(sc) = songcast.take() {
                         shutdown_songcast_nonblocking(&runtime, sc);
                     }
@@ -456,6 +507,7 @@ fn worker_loop(
                                         receiver,
                                         sink: None,
                                         last_spec: None,
+                                        last_details: None,
                                         playing: false,
                                         last_reported_sec: u32::MAX,
                                     });
@@ -487,10 +539,11 @@ fn worker_loop(
             match active.stream.next_frame_into(&mut pcm_scratch) {
                 Ok(true) => {
                     let spec = active.stream.spec();
-                    // Reopen sink if mid-stream format changed (e.g. mono MP3/ADTS or chained Ogg).
-                    if active.sink.spec() != spec {
+                    // Reopen sink if mid-stream sample rate or channel count changed.
+                    if !active.sink.spec().is_sink_compatible(&spec) {
                         let generation = active.generation;
                         let mut owned = track.take().unwrap();
+                        owned.sink.drain();
                         drop(owned.sink);
                         match sink_factory.open(spec) {
                             Ok(new_sink) => {
@@ -542,9 +595,11 @@ fn worker_loop(
                     }
                 }
                 Ok(false) => {
-                    let generation = active.generation;
-                    // Keep active sink? No, TrackEnded will trigger Load or Stop; drop track cleanly.
-                    track = None;
+                    let owned = track.take().unwrap();
+                    let generation = owned.generation;
+                    // Hold sink across EOF so the next gapless Load reuses it without clipping
+                    // the buffered tail, or DrainAndStop drains it cleanly at end-of-playlist.
+                    idle_sink = Some(owned.sink);
                     let _ = ev_tx.send(EngineEvent::TrackEnded { generation });
                 }
                 Err(err) => {
@@ -559,14 +614,15 @@ fn worker_loop(
             continue;
         }
 
-        // Pump Songcast Receiver events: drain non-blockingly first, then wait briefly.
+        // Pump bounded Songcast Receiver events per tick so cmd_rx is always responsive
+        // even when a real-time hardware sink blocks ~5 ms per write().
         if let Some(sc) = songcast.as_mut() {
-            let mut handled = false;
-            loop {
+            const MAX_SONGCAST_EVENTS_PER_TICK: usize = 4;
+            for iter in 0..MAX_SONGCAST_EVENTS_PER_TICK {
                 let ev = match sc.receiver.try_recv() {
                     Ok(ev) => Some(ev),
                     Err(tokio_mpsc::error::TryRecvError::Empty) => {
-                        if handled {
+                        if iter > 0 {
                             break;
                         }
                         // Brief wait so commands remain responsive without spinning CPU.
@@ -581,7 +637,6 @@ fn worker_loop(
                     Err(tokio_mpsc::error::TryRecvError::Disconnected) => None,
                 };
 
-                handled = true;
                 match ev {
                     Some(ReceiverEvent::Audio { frame, .. }) => {
                         if frame.flags.is_halt() {
@@ -606,33 +661,13 @@ fn worker_loop(
                             u16::from(frame.channels.max(1)),
                             u16::from(frame.bit_depth.max(16)),
                         );
-                        if sc.last_spec != Some(spec) {
+                        if !sc.last_spec.is_some_and(|s| s.is_sink_compatible(&spec)) {
                             // Drop old sink BEFORE opening new one to avoid EBUSY on exclusive devices.
                             sc.sink = None;
                             match sink_factory.open(spec) {
                                 Ok(s) => {
                                     sc.sink = Some(s);
                                     sc.last_spec = Some(spec);
-                                    let _ = ev_tx.send(EngineEvent::Details {
-                                        generation: sc.generation,
-                                        details: TrackDetails {
-                                            duration: if frame.samples_total > 0 {
-                                                (frame.samples_total / u64::from(frame.sample_rate))
-                                                    as u32
-                                            } else {
-                                                0
-                                            },
-                                            bit_rate: frame.bit_rate,
-                                            bit_depth: u32::from(frame.bit_depth),
-                                            sample_rate: frame.sample_rate,
-                                            lossless: frame.flags.is_lossless(),
-                                            codec_name: if frame.codec.is_empty() {
-                                                "PCM".into()
-                                            } else {
-                                                frame.codec.clone()
-                                            },
-                                        },
-                                    });
                                 }
                                 Err(err) => {
                                     // Tear down Songcast immediately so we don't spam errors on every UDP packet.
@@ -647,6 +682,31 @@ fn worker_loop(
                                     break;
                                 }
                             }
+                        }
+
+                        let details = TrackDetails {
+                            duration: if frame.samples_total > 0 {
+                                u32::try_from(frame.samples_total / u64::from(frame.sample_rate))
+                                    .unwrap_or(u32::MAX)
+                            } else {
+                                0
+                            },
+                            bit_rate: frame.bit_rate,
+                            bit_depth: u32::from(frame.bit_depth),
+                            sample_rate: frame.sample_rate,
+                            lossless: frame.flags.is_lossless(),
+                            codec_name: if frame.codec.is_empty() {
+                                "PCM".into()
+                            } else {
+                                frame.codec.clone()
+                            },
+                        };
+                        if sc.last_details.as_ref() != Some(&details) {
+                            sc.last_details = Some(details.clone());
+                            let _ = ev_tx.send(EngineEvent::Details {
+                                generation: sc.generation,
+                                details,
+                            });
                         }
 
                         if !sc.playing {
@@ -666,7 +726,7 @@ fn worker_loop(
                             });
                         }
 
-                        songcast_pcm_be_into_f32(&frame.audio, frame.bit_depth, &mut pcm_scratch);
+                        pcm_be_into_f32(&frame.audio, frame.bit_depth, &mut pcm_scratch);
                         if !pcm_scratch.is_empty() {
                             gain_ramp.apply(&mut pcm_scratch, spec.channels, spec.sample_rate);
                             if let Some(sink) = sc.sink.as_mut()

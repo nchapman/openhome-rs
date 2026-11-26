@@ -29,8 +29,12 @@ pub trait SinkStream {
     /// if the output buffer is full.
     fn write(&mut self, samples: &[f32]) -> Result<(), AudioError>;
 
-    /// Immediately discard any buffered audio (used on pause, seek, stop, or track change).
+    /// Immediately discard any buffered audio (used on pause, seek, stop, or manual skip).
     fn flush(&mut self) {}
+
+    /// Wait for any buffered audio to finish playing out (used on clean EOF when the sink
+    /// will be closed or reopened for a different format, preventing clipped track tails).
+    fn drain(&mut self) {}
 }
 
 /// Headless sink that discards audio, optionally sleeping to pace playback in real time.
