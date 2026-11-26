@@ -711,4 +711,126 @@ mod tests {
 
         listener.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn callback_dos_guards_error_statuses_debug_and_drop_cleanup() {
+        let listener = EventListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        assert!(format!("{listener:?}").contains("EventListener"));
+
+        // 1. Declared oversized Content-Length -> 413 Payload Too Large + Connection: close.
+        let oversized_resp = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "NOTIFY /cb/tok HTTP/1.1\r\nHost: {addr}\r\nNT: upnp:event\r\nNTS: upnp:propchange\r\nSID: uuid:big\r\nSEQ: 0\r\nContent-Length: 5242880\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+        assert!(oversized_resp.starts_with("HTTP/1.1 413"));
+        assert!(
+            oversized_resp
+                .to_ascii_lowercase()
+                .contains("connection: close")
+        );
+
+        // 2. Non-/cb/ path -> 404, missing NT/NTS -> 412, missing SID -> 412.
+        let req_404 = Request::builder()
+            .method("NOTIFY")
+            .uri("/wrong/path")
+            .header("HOST", addr.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(send_raw_http(addr, req_404).await, StatusCode::NOT_FOUND);
+
+        let req_no_nt = Request::builder()
+            .method("NOTIFY")
+            .uri("/cb/tok")
+            .header("HOST", addr.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req_no_nt).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        let req_no_sid = Request::builder()
+            .method("NOTIFY")
+            .uri("/cb/tok")
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req_no_sid).await,
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        // 3. Invalid UTF-8 and malformed XML propertyset -> 400 Bad Request.
+        let req_bad_utf8 = Request::builder()
+            .method("NOTIFY")
+            .uri("/cb/tok")
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", "uuid:bad")
+            .header("SEQ", "0")
+            .body(Full::new(Bytes::from_static(&[0xFF, 0xFE, 0xFD])))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req_bad_utf8).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let req_bad_xml = Request::builder()
+            .method("NOTIFY")
+            .uri("/cb/tok")
+            .header("HOST", addr.to_string())
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", "uuid:bad")
+            .header("SEQ", "0")
+            .body(Full::new(Bytes::from_static(b"<not-a-propertyset")))
+            .unwrap();
+        assert_eq!(
+            send_raw_http(addr, req_bad_xml).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // 4. EventSubscription Debug + Drop cleanup without calling unsubscribe().
+        let (tx, rx) = mpsc::channel(4);
+        let (renew_stop_tx, _renew_stop_rx) = watch::channel(false);
+        listener.routes.write().unwrap().insert(
+            "drop-tok".into(),
+            RouteEntry {
+                tx,
+                expected_sid: Arc::new(RwLock::new(Some("uuid:drop".into()))),
+            },
+        );
+        let sub = EventSubscription {
+            sid: "uuid:drop".into(),
+            event_sub_url: "http://127.0.0.1:1/evt/Product".into(),
+            timeout_secs: 60,
+            token: "drop-tok".into(),
+            http: HttpClient::default(),
+            routes: listener.routes.clone(),
+            rx,
+            renew_stop_tx,
+            renew_task: None,
+            unsubscribed: false,
+        };
+        assert_eq!(sub.sid(), "uuid:drop");
+        assert_eq!(sub.timeout_secs(), 60);
+        assert!(format!("{sub:?}").contains("EventSubscription"));
+        drop(sub);
+        assert!(!listener.routes.read().unwrap().contains_key("drop-tok"));
+
+        listener.shutdown().await;
+    }
 }
