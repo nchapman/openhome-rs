@@ -3,7 +3,37 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use openhome_core::types::{VolumeCharacteristics, VolumeState};
+/// Volume scale parameters for computing dB attenuation and stereo balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeCharacteristics {
+    /// Maximum volume step (e.g. `100`).
+    pub volume_max: u32,
+    /// Attenuation per step in millidecibels (e.g. `500` = 0.5 dB/step).
+    pub volume_milli_db_per_step: u32,
+    /// Maximum absolute balance value (`0` if balance is unsupported).
+    pub balance_max: u32,
+}
+
+impl Default for VolumeCharacteristics {
+    fn default() -> Self {
+        Self {
+            volume_max: 100,
+            volume_milli_db_per_step: 500,
+            balance_max: 0,
+        }
+    }
+}
+
+/// Instantaneous volume/mute/balance setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VolumeLevel {
+    /// Volume step in `0..=volume_max`.
+    pub volume: u32,
+    /// True if output is muted.
+    pub mute: bool,
+    /// Signed stereo balance in `-balance_max..=balance_max`.
+    pub balance: i32,
+}
 
 /// Interleaved PCM stream parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,8 +93,8 @@ pub fn volume_gain(volume: u32, mute: bool) -> f32 {
     volume_gain_with_chars(volume, mute, &VolumeCharacteristics::default())
 }
 
-/// Compute `(left_gain, right_gain)` for a given [`VolumeState`] and [`VolumeCharacteristics`].
-pub fn channel_gains(state: &VolumeState, chars: &VolumeCharacteristics) -> (f32, f32) {
+/// Compute `(left_gain, right_gain)` for a given [`VolumeLevel`] and [`VolumeCharacteristics`].
+pub fn channel_gains(state: &VolumeLevel, chars: &VolumeCharacteristics) -> (f32, f32) {
     let base = volume_gain_with_chars(state.volume, state.mute, chars);
     if base == 0.0 {
         return (0.0, 0.0);
@@ -80,8 +110,8 @@ pub fn channel_gains(state: &VolumeState, chars: &VolumeCharacteristics) -> (f32
     }
 }
 
-/// Apply OpenHome [`VolumeState`] in-place to interleaved `f32` samples (stateless convenience).
-pub fn apply_volume_in_place(samples: &mut [f32], channels: u16, state: &VolumeState) {
+/// Apply [`VolumeLevel`] in-place to interleaved `f32` samples (stateless convenience).
+pub fn apply_volume_in_place(samples: &mut [f32], channels: u16, state: &VolumeLevel) {
     let chars = VolumeCharacteristics {
         balance_max: if state.balance != 0 { 100 } else { 0 },
         ..VolumeCharacteristics::default()
@@ -497,12 +527,10 @@ mod tests {
         apply_volume_in_place(
             &mut stereo,
             2,
-            &VolumeState {
+            &VolumeLevel {
                 volume: 100,
                 mute: false,
                 balance: 50,
-                fade: 0,
-                volume_limit: 100,
             },
         );
         assert!((stereo[0] - 0.5).abs() < 1e-6);

@@ -10,6 +10,8 @@ Pure-Rust implementation of the [OpenHome Media](https://wiki.openhome.org/wiki/
 | `openhome-server` | Async OpenHome renderer stack: SSDP responder, HTTP/1.1 SOAP + GENA server, and service traits (`Product`, `Playlist`, `Info`, `Time`, `Volume`, `Receiver`, `Sender`). |
 | `openhome-client` | Async OpenHome control point: SSDP discovery, device description parser, typed async service clients, and GENA event subscriber. |
 | `openhome-songcast` | Pure-Rust Songcast multi-room audio transport (`OHM` multicast, `OHU` unicast, `OHZ` zone discovery) and clock-pulling synchronization. |
+| `openhome-audio` | Protocol-agnostic pure-Rust audio primitives: Symphonia HTTP/local decoding (FLAC/ALAC/MP3/AAC/Vorbis/WAV/AIFF/Ogg), lock-free SPSC ring buffer, channel/rate adapter, dB gain ramp, and `cpal` OS audio output (`CpalSink`). |
+| `openhome-endpoint` | Self-contained OpenHome Media + Songcast audio endpoint assembling `openhome-server`, `openhome-songcast`, and `openhome-audio` into a runnable renderer (`cargo run -p openhome-endpoint`). |
 
 ## Roadmap
 

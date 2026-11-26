@@ -5,6 +5,8 @@
 - `crates/openhome-server`: Async OpenHome renderer (SSDP, HTTP/1.1 SOAP, GENA eventing, service traits).
 - `crates/openhome-client`: Async OpenHome control point (SSDP discovery, typed clients, GENA subscriber).
 - `crates/openhome-songcast`: Songcast `OHM`/`OHU`/`OHZ` wire protocol, sender/receiver, clock sync.
+- `crates/openhome-audio`: Protocol-agnostic audio decoding (Symphonia), DSP, lock-free SPSC ring buffer, and `cpal` OS audio output (`CpalSink`).
+- `crates/openhome-endpoint`: Self-contained OpenHome Media + Songcast audio endpoint assembling `openhome-server`, `openhome-songcast`, and `openhome-audio`.
 
 ## Oracles
 Consult [`docs/oracle.md`](docs/oracle.md) whenever verifying service XMLs, SOAP fault codes, GENA property names, control-point quirks (Kazoo, Lumin, BubbleUPnP), or Songcast packet layouts.

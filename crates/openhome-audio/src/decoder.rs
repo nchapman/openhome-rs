@@ -19,7 +19,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::{Time, TimeBase};
 
-use crate::error::PlayerError;
+use crate::error::AudioError;
 use crate::format::PcmSpec;
 
 /// Maximum buffered HTTP audio payload size when fetching finite tracks (256 MiB).
@@ -29,8 +29,13 @@ const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Returns `true` if `uri` uses an `http://` or `https://` scheme (case-insensitive).
 pub fn is_http_uri(uri: &str) -> bool {
-    uri.len() >= 7 && uri[..7].eq_ignore_ascii_case("http://")
-        || uri.len() >= 8 && uri[..8].eq_ignore_ascii_case("https://")
+    let trimmed = uri.trim();
+    trimmed
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+        || trimmed
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
 }
 
 /// Optional cooperative cancellation token checked during HTTP fetches.
@@ -123,12 +128,12 @@ impl DecodedStream {
     /// Local filesystem paths and `file://` URIs are rejected by default for security;
     /// use [`DecodedStream::open_local`] or [`DecodedStream::open_with_options`] when local
     /// file access is explicitly desired.
-    pub fn open(uri: &str) -> Result<Self, PlayerError> {
+    pub fn open(uri: &str) -> Result<Self, AudioError> {
         Self::open_with_options(uri, false, None)
     }
 
     /// Open and probe a local audio file on disk.
-    pub fn open_local(path: &Path) -> Result<Self, PlayerError> {
+    pub fn open_local(path: &Path) -> Result<Self, AudioError> {
         Self::open_with_options(&path.to_string_lossy(), true, None)
     }
 
@@ -137,7 +142,7 @@ impl DecodedStream {
         uri: &str,
         allow_local_files: bool,
         cancel: Option<LoadCancel>,
-    ) -> Result<Self, PlayerError> {
+    ) -> Result<Self, AudioError> {
         let OpenedSource {
             source,
             hint,
@@ -155,7 +160,7 @@ impl DecodedStream {
                 },
                 &MetadataOptions::default(),
             )
-            .map_err(|e| PlayerError::Decode(format!("probe failed for {uri}: {e}")))?;
+            .map_err(|e| AudioError::Decode(format!("probe failed for {uri}: {e}")))?;
 
         let format = probed.format;
         let track = format
@@ -167,14 +172,14 @@ impl DecodedStream {
                     .iter()
                     .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
             })
-            .ok_or_else(|| PlayerError::Decode(format!("no audio track found in {uri}")))?;
+            .ok_or_else(|| AudioError::Decode(format!("no audio track found in {uri}")))?;
 
         let track_id = track.id;
         let params = &track.codec_params;
         let codec_info = classify_codec(params.codec);
         let sample_rate = params
             .sample_rate
-            .ok_or_else(|| PlayerError::Decode("missing sample rate".into()))?;
+            .ok_or_else(|| AudioError::Decode("missing sample rate".into()))?;
         let channels = params
             .channels
             .map(|c| c.count() as u16)
@@ -208,7 +213,7 @@ impl DecodedStream {
 
         let decoder = symphonia::default::get_codecs()
             .make(params, &DecoderOptions::default())
-            .map_err(|e| PlayerError::Decode(format!("unsupported codec in {uri}: {e}")))?;
+            .map_err(|e| AudioError::Decode(format!("unsupported codec in {uri}: {e}")))?;
 
         Ok(Self {
             format,
@@ -251,7 +256,7 @@ impl DecodedStream {
     }
 
     /// Seek to `seconds` from the start of the track using the stream's [`TimeBase`].
-    pub fn seek(&mut self, seconds: u32) -> Result<u32, PlayerError> {
+    pub fn seek(&mut self, seconds: u32) -> Result<u32, AudioError> {
         let seeked = self
             .format
             .seek(
@@ -261,7 +266,7 @@ impl DecodedStream {
                     track_id: Some(self.track_id),
                 },
             )
-            .map_err(|e| PlayerError::Decode(format!("seek failed: {e}")))?;
+            .map_err(|e| AudioError::Decode(format!("seek failed: {e}")))?;
         self.decoder.reset();
         let rel_ts = seeked.actual_ts.saturating_sub(self.start_ts);
         let actual_secs = self.time_base.calc_time(rel_ts).seconds as u32;
@@ -272,7 +277,7 @@ impl DecodedStream {
     ///
     /// Returns `Ok(true)` if samples were written to `out`, or `Ok(false)` at clean EOF.
     /// Updates [`DecodedStream::spec`] if the decoded frame's sample rate or channel count changed.
-    pub fn next_frame_into(&mut self, out: &mut Vec<f32>) -> Result<bool, PlayerError> {
+    pub fn next_frame_into(&mut self, out: &mut Vec<f32>) -> Result<bool, AudioError> {
         out.clear();
         loop {
             let packet = match self.format.next_packet() {
@@ -286,7 +291,7 @@ impl DecodedStream {
                     self.decoder.reset();
                     continue;
                 }
-                Err(err) => return Err(PlayerError::Decode(err.to_string())),
+                Err(err) => return Err(AudioError::Decode(err.to_string())),
             };
 
             if packet.track_id() != self.track_id {
@@ -301,7 +306,7 @@ impl DecodedStream {
                 {
                     return Ok(false);
                 }
-                Err(err) => return Err(PlayerError::Decode(err.to_string())),
+                Err(err) => return Err(AudioError::Decode(err.to_string())),
             };
 
             let frames = decoded.frames();
@@ -335,7 +340,7 @@ impl DecodedStream {
     /// Decode the next block of interleaved normalized `f32` samples.
     ///
     /// Returns `Ok(None)` at clean end-of-stream.
-    pub fn next_frame(&mut self) -> Result<Option<Vec<f32>>, PlayerError> {
+    pub fn next_frame(&mut self) -> Result<Option<Vec<f32>>, AudioError> {
         let mut buf = Vec::new();
         if self.next_frame_into(&mut buf)? {
             Ok(Some(buf))
@@ -406,9 +411,9 @@ fn open_media_source(
     uri: &str,
     allow_local_files: bool,
     cancel: Option<LoadCancel>,
-) -> Result<OpenedSource, PlayerError> {
+) -> Result<OpenedSource, AudioError> {
     if cancel.as_ref().is_some_and(LoadCancel::is_cancelled) {
-        return Err(PlayerError::Source("track load cancelled".into()));
+        return Err(AudioError::Source("track load cancelled".into()));
     }
 
     let mut hint = Hint::new();
@@ -430,7 +435,7 @@ fn open_media_source(
         let resp = agent
             .get(uri)
             .call()
-            .map_err(|e| PlayerError::Source(format!("HTTP GET {uri} failed: {e}")))?;
+            .map_err(|e| AudioError::Source(format!("HTTP GET {uri} failed: {e}")))?;
 
         let content_len = resp
             .headers()
@@ -464,7 +469,7 @@ fn open_media_source(
             let mut reader = reader;
             reader
                 .read_to_end(&mut data)
-                .map_err(|e| PlayerError::Source(format!("HTTP read {uri} failed: {e}")))?;
+                .map_err(|e| AudioError::Source(format!("HTTP read {uri} failed: {e}")))?;
             let actual_len = data.len() as u64;
             return Ok(OpenedSource {
                 source: Box::new(Cursor::new(data)),
@@ -489,14 +494,14 @@ fn open_media_source(
     }
 
     if !allow_local_files {
-        return Err(PlayerError::Source(format!(
+        return Err(AudioError::Source(format!(
             "unsupported URI scheme (only http:// and https:// are allowed): {uri}"
         )));
     }
 
     let local_path = uri.strip_prefix("file://").unwrap_or(uri);
     let file = File::open(local_path)
-        .map_err(|e| PlayerError::Source(format!("cannot open {local_path}: {e}")))?;
+        .map_err(|e| AudioError::Source(format!("cannot open {local_path}: {e}")))?;
     let byte_len = file.metadata().ok().map(|m| m.len());
     Ok(OpenedSource {
         source: Box::new(file),
@@ -550,6 +555,7 @@ mod tests {
         assert!(DecodedStream::open(&path.to_string_lossy()).is_err());
         assert!(is_http_uri("HTTP://example.com/a.flac"));
         assert!(is_http_uri("https://example.com/a.flac"));
+        assert!(!is_http_uri("🎵🎵🎵/track.flac"));
         assert!(!is_http_uri("file:///etc/passwd"));
 
         // Explicit local open succeeds.

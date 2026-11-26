@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use openhome_client::OpenHomeDevice;
 use openhome_core::types::{ReceiverState, TransportState};
-use openhome_player::{
-    AudioSink, CaptureSink, EngineCommand, OpenHomePlayer, PcmSpec, PlaybackEngine, PlayerConfig,
-    PlayerError, SinkStream,
+use openhome_endpoint::{
+    AudioError, AudioSink, CaptureSink, EndpointConfig, EngineCommand, OpenHomeEndpoint, PcmSpec,
+    PlaybackEngine, SinkStream,
 };
 use openhome_songcast::{AudioFormat, SenderConfig, SongcastSender};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -129,18 +129,18 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
     let (http_addr, http_task) = spawn_wav_http_server(wav1, wav2).await;
 
     let capture = Arc::new(CaptureSink::new());
-    let cfg = PlayerConfig {
+    let cfg = EndpointConfig {
         room: "Studio".into(),
         name: "Test Player".into(),
         udn: Some("uuid:openhome-player-test-1".into()),
         bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         advertise_host: Some("127.0.0.1".into()),
         sink: Arc::clone(&capture) as Arc<dyn AudioSink>,
-        ..PlayerConfig::default()
+        ..EndpointConfig::default()
     };
-    assert!(format!("{cfg:?}").contains("PlayerConfig"));
-    let player = OpenHomePlayer::start(cfg).await.unwrap();
-    assert!(format!("{player:?}").contains("OpenHomePlayer"));
+    assert!(format!("{cfg:?}").contains("EndpointConfig"));
+    let player = OpenHomeEndpoint::start(cfg).await.unwrap();
+    assert!(format!("{player:?}").contains("OpenHomeEndpoint"));
 
     let dev = OpenHomeDevice::connect(player.description_url())
         .await
@@ -261,22 +261,42 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
         .fold(0.0f32, |acc, &s| acc.max(s.abs()));
     assert_eq!(muted_max, 0.0, "muted output must be silence");
 
-    // Exercise remaining Playlist & Product controls cleanly.
+    // Exercise remaining Playlist, Volume & Product controls cleanly.
+    assert!(playlist.tracks_max().await.unwrap() >= 100);
+    assert_eq!(playlist.read(id3).await.unwrap().id, id3);
+    assert_eq!(playlist.read_list(&[id3]).await.unwrap().len(), 1);
+    assert_eq!(product.source_index().await.unwrap(), 0);
+    let _ = info.counters().await.unwrap();
     volume.set_mute(false).await.unwrap();
+    volume.volume_inc().await.unwrap();
+    volume.volume_dec().await.unwrap();
+    let _ = volume.set_balance(0).await;
+    let _ = volume.set_fade(0).await;
+    let _ = product.set_source_index_by_name("Playlist").await;
     playlist.set_repeat(true).await.unwrap();
     assert!(playlist.repeat().await.unwrap());
     playlist.set_shuffle(true).await.unwrap();
     assert!(playlist.shuffle().await.unwrap());
     playlist.seek_index(0).await.unwrap();
     playlist.pause().await.unwrap();
-    playlist.play().await.unwrap();
     playlist.seek_second_absolute(0).await.unwrap();
+    playlist.play().await.unwrap();
     playlist.seek_second_relative(0).await.unwrap();
     playlist.next().await.unwrap();
     playlist.previous().await.unwrap();
-    playlist.stop().await.unwrap();
+    product.set_standby(true).await.unwrap();
+    assert!(product.standby().await.unwrap());
+    product.set_standby(false).await.unwrap();
     playlist.delete_id(id3).await.unwrap();
     playlist.delete_all().await.unwrap();
+    // Play on an empty queue stops cleanly without error.
+    playlist.play().await.unwrap();
+    assert_eq!(
+        playlist.transport_state().await.unwrap(),
+        TransportState::Stopped
+    );
+    assert!(player.local_addr().port() > 0);
+    assert!(format!("{:?}", EndpointConfig::default()).contains("EndpointConfig"));
 
     // Unreachable URI triggers clean error recovery back to Stopped.
     let bad_id = playlist
@@ -314,14 +334,14 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
 #[tokio::test]
 async fn songcast_receiver_streams_pcm_and_metadata_to_capture_sink() {
     let capture = Arc::new(CaptureSink::new());
-    let player = OpenHomePlayer::start(PlayerConfig {
+    let player = OpenHomeEndpoint::start(EndpointConfig {
         room: "Lounge".into(),
         name: "Songcast Player".into(),
         bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         advertise_host: Some("127.0.0.1".into()),
         songcast_interface: Ipv4Addr::LOCALHOST,
-        sink: Arc::clone(&capture) as Arc<dyn openhome_player::AudioSink>,
-        ..PlayerConfig::default()
+        sink: Arc::clone(&capture) as Arc<dyn openhome_endpoint::AudioSink>,
+        ..EndpointConfig::default()
     })
     .await
     .unwrap();
@@ -395,6 +415,35 @@ async fn songcast_receiver_streams_pcm_and_metadata_to_capture_sink() {
         info.metatext().await.unwrap(),
         "<DIDL-Lite>Live</DIDL-Lite>"
     );
+
+    // Send a Songcast HALT frame -> Receiver transitions to Waiting, then resume at 48 kHz.
+    let _ = sender.send_audio(&audio_cfg, Vec::new(), true).await;
+    let mut saw_waiting = false;
+    for _ in 0..40 {
+        if receiver.transport_state().await.unwrap() == ReceiverState::Waiting {
+            saw_waiting = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(saw_waiting, "HALT frame must move Receiver to Waiting");
+
+    // Resume at 48 kHz -> forces Songcast sink reopen for new PcmSpec.
+    let audio_48k = AudioFormat::pcm(48_000, 16, 2);
+    let mut got_48k = false;
+    for _ in 0..40 {
+        let _ = sender.send_audio(&audio_48k, pcm_be.clone(), false).await;
+        if capture
+            .frames()
+            .iter()
+            .any(|f| f.spec == PcmSpec::new(48_000, 2, 16))
+        {
+            got_48k = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(got_48k, "Songcast format switch to 48kHz must reopen sink");
     assert_eq!(
         receiver.transport_state().await.unwrap(),
         ReceiverState::Playing
@@ -435,9 +484,9 @@ impl AudioSink for FailingSink {
         "failing"
     }
 
-    fn open(&self, spec: PcmSpec) -> Result<Box<dyn SinkStream>, PlayerError> {
+    fn open(&self, spec: PcmSpec) -> Result<Box<dyn SinkStream>, AudioError> {
         if self.fail_on_open {
-            return Err(PlayerError::Sink("device busy".into()));
+            return Err(AudioError::Sink("device busy".into()));
         }
         Ok(Box::new(FailingStream { spec }))
     }
@@ -452,8 +501,8 @@ impl SinkStream for FailingStream {
         self.spec
     }
 
-    fn write(&mut self, _samples: &[f32]) -> Result<(), PlayerError> {
-        Err(PlayerError::Sink("write underrun".into()))
+    fn write(&mut self, _samples: &[f32]) -> Result<(), AudioError> {
+        Err(AudioError::Sink("write underrun".into()))
     }
 }
 
@@ -486,7 +535,7 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
         if let Some(ev) = tokio::time::timeout(Duration::from_secs(2), ev_rx.recv())
             .await
             .unwrap()
-            && matches!(ev, openhome_player::EngineEvent::Error { .. })
+            && matches!(ev, openhome_endpoint::EngineEvent::Error { .. })
         {
             saw_open_err = true;
             break;
@@ -506,7 +555,7 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
         .unwrap();
     assert!(matches!(
         ev,
-        openhome_player::EngineEvent::Error { generation: 2, .. }
+        openhome_endpoint::EngineEvent::Error { generation: 2, .. }
     ));
     engine.shutdown();
 
@@ -532,23 +581,124 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
         if let Some(ev) = tokio::time::timeout(Duration::from_secs(2), ev_rx2.recv())
             .await
             .unwrap()
-            && matches!(ev, openhome_player::EngineEvent::Error { .. })
+            && matches!(ev, openhome_endpoint::EngineEvent::Error { .. })
         {
             saw_write_err = true;
             break;
         }
     }
     assert!(saw_write_err);
+    // Invalid Songcast URI emits EngineEvent::Error cleanly without panicking.
+    engine2.send(EngineCommand::StartSongcast {
+        generation: 4,
+        uri: "not-a-valid-songcast-uri".into(),
+        interface: Ipv4Addr::LOCALHOST,
+    });
+    let mut saw_sc_err = false;
+    for _ in 0..40 {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(50), ev_rx2.recv()).await
+            && matches!(
+                ev,
+                openhome_endpoint::EngineEvent::Error { generation: 4, .. }
+            )
+        {
+            saw_sc_err = true;
+            break;
+        }
+    }
+    assert!(
+        saw_sc_err,
+        "invalid Songcast URI must emit EngineEvent::Error"
+    );
+
     drop(engine2);
 
-    // 4. OpenHomePlayer dropped without calling shutdown() exits cleanly.
-    let player = OpenHomePlayer::start(PlayerConfig {
+    // 4. OpenHomeEndpoint dropped without calling shutdown() exits cleanly.
+    let player = OpenHomeEndpoint::start(EndpointConfig {
         sink: Arc::new(CaptureSink::new()),
-        ..PlayerConfig::default()
+        ..EndpointConfig::default()
     })
     .await
     .unwrap();
     drop(player);
+
+    // Exercise superseded Load skip + Load(paused: true) -> Seek -> Play -> Pause -> Stop.
+    let gen_ref = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let (cap_engine, mut cap_rx) = PlaybackEngine::spawn_with_options(
+        Arc::new(CaptureSink::new()),
+        tokio::runtime::Handle::current(),
+        Arc::clone(&gen_ref),
+        true,
+        openhome_core::types::VolumeCharacteristics::default(),
+    );
+    // Stale generation Load is skipped immediately without touching disk.
+    cap_engine.send(EngineCommand::Load {
+        generation: 999,
+        uri: "/nonexistent/stale.wav".into(),
+        paused: false,
+    });
+    cap_engine.send(EngineCommand::Load {
+        generation: 1,
+        uri: path.to_string_lossy().into_owned(),
+        paused: true,
+    });
+    let mut saw_paused = false;
+    for _ in 0..40 {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(50), cap_rx.recv()).await
+            && matches!(
+                ev,
+                openhome_endpoint::EngineEvent::StateChanged {
+                    generation: 1,
+                    state: TransportState::Paused
+                }
+            )
+        {
+            saw_paused = true;
+            break;
+        }
+    }
+    assert!(saw_paused, "Load(paused=true) must emit Paused");
+    cap_engine.send(EngineCommand::Seek(0));
+    let mut saw_seek_time = false;
+    for _ in 0..40 {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(50), cap_rx.recv()).await
+            && matches!(
+                ev,
+                openhome_endpoint::EngineEvent::Time {
+                    generation: 1,
+                    seconds: 0
+                }
+            )
+        {
+            saw_seek_time = true;
+            break;
+        }
+    }
+    assert!(saw_seek_time, "Seek(0) must emit Time(0)");
+    cap_engine.send(EngineCommand::Play);
+    cap_engine.send(EngineCommand::Pause);
+    cap_engine.send(EngineCommand::Stop);
+    cap_engine.send(EngineCommand::SetVolume(
+        openhome_core::types::VolumeState {
+            volume: 80,
+            mute: false,
+            balance: 0,
+            fade: 0,
+            volume_limit: 100,
+        },
+    ));
+    tokio::task::spawn_blocking(move || cap_engine.shutdown())
+        .await
+        .unwrap();
+
+    // Dropping OpenHomeEndpoint without calling shutdown() cleans up its background tasks.
+    let drop_ep = OpenHomeEndpoint::start(EndpointConfig {
+        sink: Arc::new(openhome_endpoint::NullSink::unpaced()),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+    drop(drop_ep);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -564,13 +714,13 @@ async fn paused_next_loads_new_track_and_current_thread_songcast_shutdown_does_n
         fn name(&self) -> &str {
             "paced-capture"
         }
-        fn open(&self, spec: PcmSpec) -> Result<Box<dyn SinkStream>, PlayerError> {
+        fn open(&self, spec: PcmSpec) -> Result<Box<dyn SinkStream>, AudioError> {
             struct Stream(Box<dyn SinkStream>);
             impl SinkStream for Stream {
                 fn spec(&self) -> PcmSpec {
                     self.0.spec()
                 }
-                fn write(&mut self, samples: &[f32]) -> Result<(), PlayerError> {
+                fn write(&mut self, samples: &[f32]) -> Result<(), AudioError> {
                     std::thread::sleep(Duration::from_millis(5));
                     self.0.write(samples)
                 }
@@ -583,14 +733,14 @@ async fn paused_next_loads_new_track_and_current_thread_songcast_shutdown_does_n
     }
 
     let capture = Arc::new(CaptureSink::new());
-    let player = OpenHomePlayer::start(PlayerConfig {
+    let player = OpenHomeEndpoint::start(EndpointConfig {
         room: "Den".into(),
         name: "State Test".into(),
         bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         advertise_host: Some("127.0.0.1".into()),
         songcast_interface: Ipv4Addr::LOCALHOST,
         sink: Arc::new(PacedCapture(Arc::clone(&capture))),
-        ..PlayerConfig::default()
+        ..EndpointConfig::default()
     })
     .await
     .unwrap();
@@ -720,7 +870,7 @@ async fn songcast_sink_open_and_write_errors_tear_down_without_storm() {
         if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(20), ev_rx.recv()).await
             && matches!(
                 ev,
-                openhome_player::EngineEvent::Error { generation: 1, .. }
+                openhome_endpoint::EngineEvent::Error { generation: 1, .. }
             )
         {
             saw_err = true;
@@ -760,7 +910,7 @@ async fn songcast_sink_open_and_write_errors_tear_down_without_storm() {
         if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(20), ev_rx2.recv()).await
             && matches!(
                 ev,
-                openhome_player::EngineEvent::Error { generation: 2, .. }
+                openhome_endpoint::EngineEvent::Error { generation: 2, .. }
             )
         {
             saw_write_err = true;

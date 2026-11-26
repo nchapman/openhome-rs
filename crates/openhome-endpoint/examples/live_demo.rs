@@ -1,14 +1,14 @@
 //! Live local end-to-end demo:
-//! - Starts `OpenHomePlayer` with real CoreAudio/ALSA/WASAPI output (with `--features cpal-output`)
+//! - Starts `OpenHomeEndpoint` with real CoreAudio/ALSA/WASAPI output (`CpalSink`)
 //!   and real SSDP multicast discovery
 //! - Serves two gentle-volume stereo WAV tracks over local HTTP
-//! - Discovers the player via `openhome-client` SSDP, subscribes to GENA events, and drives
+//! - Discovers the endpoint via `openhome-client` SSDP, subscribes to GENA events, and drives
 //!   Playlist playback (Play, Volume, Pause, Resume, Seek, Next)
 //! - Switches to Songcast Receiver and streams live PCM from `SongcastSender`
 //!
 //! Run with:
 //! ```sh
-//! cargo run -p openhome-player --example live_demo
+//! cargo run -p openhome-endpoint --example live_demo
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use openhome_client::{DiscoveryOptions, EventListener, OpenHomeDevice, discover};
 use openhome_core::{SourceType, urn};
-use openhome_player::{AudioSink, OpenHomePlayer, PlayerConfig};
+use openhome_endpoint::{CpalSink, EndpointConfig, OpenHomeEndpoint};
 use openhome_server::SsdpConfig;
 use openhome_songcast::{AudioFormat, SenderConfig, SongcastSender};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -104,31 +104,19 @@ async fn spawn_http_wav_server(
     (addr, handle)
 }
 
-#[cfg(feature = "cpal-output")]
-fn make_sink() -> Arc<dyn AudioSink> {
-    println!("[audio] using real CpalSink (OS default audio output)");
-    Arc::new(openhome_player::CpalSink::default_device())
-}
-
-#[cfg(not(feature = "cpal-output"))]
-fn make_sink() -> Arc<dyn AudioSink> {
-    println!("[audio] built without --features cpal-output; using realtime NullSink");
-    Arc::new(openhome_player::NullSink::realtime())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room = "OpenHome Live Demo";
-    let name = "openhome-rs Demo Player";
+    let name = "openhome-rs Demo Endpoint";
 
-    println!("=== 1. Starting OpenHomePlayer ===");
-    let player = OpenHomePlayer::start(PlayerConfig {
+    println!("=== 1. Starting OpenHomeEndpoint ===");
+    let player = OpenHomeEndpoint::start(EndpointConfig {
         room: room.into(),
         name: name.into(),
         bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         ssdp: SsdpConfig::default(),
-        sink: make_sink(),
-        ..PlayerConfig::default()
+        sink: Arc::new(CpalSink::default_device()),
+        ..EndpointConfig::default()
     })
     .await?;
     println!("  HTTP server : {}", player.local_addr());

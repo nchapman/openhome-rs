@@ -7,15 +7,31 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use openhome_audio::{
+    AudioSink, DecodedStream, GainRamp, LoadCancel, PcmSpec, SinkStream,
+    VolumeCharacteristics as AudioVolumeChars, VolumeLevel, channel_gains as audio_channel_gains,
+    songcast_pcm_be_into_f32,
+};
 use openhome_core::types::{
     ReceiverState, TrackDetails, TransportState, VolumeCharacteristics, VolumeState,
 };
 use openhome_songcast::{ReceiverConfig, ReceiverEvent, SongcastReceiver, SongcastUri};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::decoder::{DecodedStream, LoadCancel};
-use crate::format::{GainRamp, PcmSpec, channel_gains, songcast_pcm_be_into_f32};
-use crate::sink::{AudioSink, SinkStream};
+fn channel_gains(state: &VolumeState, chars: &VolumeCharacteristics) -> (f32, f32) {
+    audio_channel_gains(
+        &VolumeLevel {
+            volume: state.volume,
+            mute: state.mute,
+            balance: state.balance,
+        },
+        &AudioVolumeChars {
+            volume_max: chars.volume_max,
+            volume_milli_db_per_step: chars.volume_milli_db_per_step,
+            balance_max: chars.balance_max,
+        },
+    )
+}
 
 /// Commands sent from OpenHome service handlers into [`PlaybackEngine`].
 #[derive(Debug, Clone)]
@@ -122,7 +138,7 @@ impl PlaybackEngine {
         let (ev_tx, ev_rx) = tokio_mpsc::unbounded_channel();
         let worker_gen = Arc::clone(&latest_generation);
         let worker = thread::Builder::new()
-            .name("openhome-player-worker".into())
+            .name("openhome-endpoint-worker".into())
             .spawn(move || {
                 worker_loop(
                     sink,
@@ -134,7 +150,7 @@ impl PlaybackEngine {
                     volume_chars,
                 )
             })
-            .expect("spawn openhome-player-worker");
+            .expect("spawn openhome-endpoint-worker");
         (
             Self {
                 cmd_tx,

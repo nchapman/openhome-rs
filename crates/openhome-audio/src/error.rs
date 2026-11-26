@@ -1,10 +1,10 @@
-//! Error types for `openhome-player`.
+//! Error types for `openhome-audio`.
 
 use thiserror::Error;
 
-/// Errors produced by audio decoding, sink output, or player startup.
+/// Errors produced by audio fetching, decoding, or output sink operations.
 #[derive(Debug, Error)]
-pub enum PlayerError {
+pub enum AudioError {
     /// Failed to fetch or open an audio source URI.
     #[error("source error: {0}")]
     Source(String),
@@ -14,12 +14,6 @@ pub enum PlayerError {
     /// Audio output sink error.
     #[error("sink error: {0}")]
     Sink(String),
-    /// Underlying OpenHome server error.
-    #[error("server error: {0}")]
-    Server(#[from] openhome_server::ServerError),
-    /// Underlying Songcast error.
-    #[error("songcast error: {0}")]
-    Songcast(#[from] openhome_songcast::SongcastError),
     /// Underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -1,9 +1,10 @@
-//! High-level [`OpenHomePlayer`] bridging `openhome-server` services and [`PlaybackEngine`].
+//! High-level [`OpenHomeEndpoint`] bridging `openhome-server` services and [`PlaybackEngine`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use openhome_audio::{AudioSink, NullSink, is_http_uri};
 use openhome_core::Fault;
 use openhome_core::types::{
     DeviceAttributes, InfoCounters, ProductInfo, ReceiverState, Source, SourceType, TrackDetails,
@@ -16,10 +17,8 @@ use openhome_server::{
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::decoder::is_http_uri;
 use crate::engine::{EngineCommand, EngineEvent, PlaybackEngine};
-use crate::error::PlayerError;
-use crate::sink::{AudioSink, NullSink};
+use crate::error::EndpointError;
 
 /// Exact UPnP `ProtocolInfo` list matching the codecs/containers enabled in `symphonia`.
 /// (Omits raw headerless `audio/L16` so media servers don't send unprobeable PCM.)
@@ -37,9 +36,9 @@ http-get:*:audio/x-aiff:*,\
 http-get:*:audio/ogg:*,\
 http-get:*:application/ogg:*";
 
-/// Configuration for starting an [`OpenHomePlayer`].
+/// Configuration for starting an [`OpenHomeEndpoint`].
 #[derive(Clone)]
-pub struct PlayerConfig {
+pub struct EndpointConfig {
     /// OpenHome room name (e.g. `"Living Room"`).
     pub room: String,
     /// OpenHome product/device name (e.g. `"OpenHome Player"`).
@@ -63,9 +62,9 @@ pub struct PlayerConfig {
     pub sink: Arc<dyn AudioSink>,
 }
 
-impl std::fmt::Debug for PlayerConfig {
+impl std::fmt::Debug for EndpointConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlayerConfig")
+        f.debug_struct("EndpointConfig")
             .field("room", &self.room)
             .field("name", &self.name)
             .field("bind_addr", &self.bind_addr)
@@ -75,7 +74,7 @@ impl std::fmt::Debug for PlayerConfig {
     }
 }
 
-impl Default for PlayerConfig {
+impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
             room: "Main Room".into(),
@@ -91,7 +90,7 @@ impl Default for PlayerConfig {
     }
 }
 
-struct PlayerCore {
+struct EndpointCore {
     state: MemoryRenderer,
     engine: PlaybackEngine,
     generation: Arc<AtomicU64>,
@@ -101,7 +100,7 @@ struct PlayerCore {
     notifier: OnceLock<ServerNotifier>,
 }
 
-impl PlayerCore {
+impl EndpointCore {
     fn next_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -246,7 +245,7 @@ impl PlayerCore {
     }
 }
 
-impl ProductService for PlayerCore {
+impl ProductService for EndpointCore {
     fn product_info(&self) -> ProductInfo {
         self.state.product_info()
     }
@@ -289,7 +288,7 @@ impl ProductService for PlayerCore {
     }
 }
 
-impl PlaylistService for PlayerCore {
+impl PlaylistService for EndpointCore {
     fn play(&self) -> ActionResult<()> {
         let was_paused = PlaylistService::transport_state(&self.state) == TransportState::Paused
             && self.is_playlist_active();
@@ -462,7 +461,7 @@ impl PlaylistService for PlayerCore {
     }
 }
 
-impl InfoService for PlayerCore {
+impl InfoService for EndpointCore {
     fn counters(&self) -> InfoCounters {
         self.state.counters()
     }
@@ -480,13 +479,13 @@ impl InfoService for PlayerCore {
     }
 }
 
-impl TimeService for PlayerCore {
+impl TimeService for EndpointCore {
     fn time(&self) -> TrackTime {
         self.state.time()
     }
 }
 
-impl VolumeService for PlayerCore {
+impl VolumeService for EndpointCore {
     fn characteristics(&self) -> VolumeCharacteristics {
         self.state.characteristics()
     }
@@ -538,7 +537,7 @@ impl VolumeService for PlayerCore {
     }
 }
 
-impl ReceiverService for PlayerCore {
+impl ReceiverService for EndpointCore {
     fn play(&self) -> ActionResult<()> {
         ReceiverService::play(&self.state)?;
         let (uri, _) = self.state.sender();
@@ -601,27 +600,27 @@ impl ReceiverService for PlayerCore {
 }
 
 /// Running self-contained OpenHome Media + Songcast player.
-pub struct OpenHomePlayer {
+pub struct OpenHomeEndpoint {
     server: Option<OpenHomeServer>,
     local_addr: SocketAddr,
     description_url: String,
-    core: Arc<PlayerCore>,
+    core: Arc<EndpointCore>,
     pump_stop_tx: watch::Sender<bool>,
     pump_task: Option<JoinHandle<()>>,
 }
 
-impl std::fmt::Debug for OpenHomePlayer {
+impl std::fmt::Debug for OpenHomeEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenHomePlayer")
+        f.debug_struct("OpenHomeEndpoint")
             .field("local_addr", &self.local_addr)
             .field("description_url", &self.description_url)
             .finish()
     }
 }
 
-impl OpenHomePlayer {
-    /// Start a new [`OpenHomePlayer`] with the given [`PlayerConfig`].
-    pub async fn start(config: PlayerConfig) -> Result<Self, PlayerError> {
+impl OpenHomeEndpoint {
+    /// Start a new [`OpenHomeEndpoint`] with the given [`EndpointConfig`].
+    pub async fn start(config: EndpointConfig) -> Result<Self, EndpointError> {
         let runtime = tokio::runtime::Handle::current();
         let state = MemoryRenderer::new(&config.room, &config.name);
         // Only advertise services we actually register (no SenderService).
@@ -645,7 +644,7 @@ impl OpenHomePlayer {
         );
         engine.send(EngineCommand::SetVolume(state.state()));
 
-        let core = Arc::new(PlayerCore {
+        let core = Arc::new(EndpointCore {
             state,
             engine,
             generation,
@@ -728,7 +727,7 @@ impl OpenHomePlayer {
     }
 }
 
-impl Drop for OpenHomePlayer {
+impl Drop for OpenHomeEndpoint {
     fn drop(&mut self) {
         self.core.engine.send(EngineCommand::Shutdown);
         let _ = self.pump_stop_tx.send(true);
