@@ -14,4 +14,5 @@ openhome-core.workspace = true
 openhome-server.workspace = true
 openhome-client.workspace = true
 openhome-songcast.workspace = true
+proptest = "1"
 tokio = { workspace = true, features = ["io-util"] }
