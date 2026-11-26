@@ -53,6 +53,8 @@ struct Inner {
     transport_state: TransportState,
     repeat: bool,
     shuffle: bool,
+    shuffle_order: Vec<u32>,
+    shuffle_seed: u64,
     playlist_protocol_info: String,
 
     // Info & Time
@@ -108,10 +110,12 @@ impl Inner {
             }
             self.source_index = idx;
             self.standby = false;
-            // Clear stale Info metadata when switching away from the previous source.
+            // Clear stale Info metadata and details when switching away from the previous source.
             self.current_uri.clear();
             self.current_metadata.clear();
+            self.details = TrackDetails::default();
             self.metatext.clear();
+            self.time.duration = 0;
             self.time.seconds = 0;
         }
     }
@@ -129,16 +133,152 @@ impl Inner {
         self.current_id = entry.id;
         self.current_uri = entry.uri.clone();
         self.current_metadata = entry.metadata.clone();
+        self.details = TrackDetails::default();
         self.counters.track_count = self.counters.track_count.wrapping_add(1);
         self.time.track_count = self.counters.track_count;
+        self.time.duration = 0;
         self.time.seconds = 0;
+    }
+
+    fn select_track_by_id(&mut self, id: u32) -> bool {
+        if let Some(pos) = self.tracks.iter().position(|t| t.id == id) {
+            self.select_track_by_idx(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn rebuild_shuffle_order(&mut self) {
+        let mut order: Vec<u32> = self.tracks.iter().map(|t| t.id).collect();
+        // Deterministic Fisher-Yates shuffle using xorshift64 (no external RNG dep).
+        let mut s = self.shuffle_seed.wrapping_add(order.len() as u64).max(1);
+        for i in (1..order.len()).rev() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let j = (s as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        self.shuffle_seed = s;
+        // Keep the currently playing track at index 0 when shuffle is toggled on.
+        if self.current_id != 0
+            && let Some(pos) = order.iter().position(|&id| id == self.current_id)
+        {
+            order.swap(0, pos);
+        }
+        self.shuffle_order = order;
     }
 
     fn clear_current_track(&mut self) {
         self.current_id = 0;
         self.current_uri.clear();
         self.current_metadata.clear();
+        self.details = TrackDetails::default();
+        self.time.duration = 0;
         self.time.seconds = 0;
+    }
+
+    fn advance_next(&mut self) -> Option<u32> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        if self.shuffle {
+            if self.shuffle_order.len() != self.tracks.len() {
+                self.rebuild_shuffle_order();
+            }
+            let next_id = match self
+                .shuffle_order
+                .iter()
+                .position(|&id| id == self.current_id)
+            {
+                None => self.shuffle_order.first().copied(),
+                Some(cur) if cur + 1 < self.shuffle_order.len() => {
+                    Some(self.shuffle_order[cur + 1])
+                }
+                Some(_) if self.repeat => self.shuffle_order.first().copied(),
+                Some(_) => {
+                    self.transport_state = TransportState::Stopped;
+                    return None;
+                }
+            };
+            if let Some(id) = next_id
+                && self.select_track_by_id(id)
+            {
+                return Some(id);
+            }
+            return None;
+        }
+
+        match self.tracks.iter().position(|t| t.id == self.current_id) {
+            None => {
+                self.select_track_by_idx(0);
+                Some(self.current_id)
+            }
+            Some(cur) if cur + 1 < self.tracks.len() => {
+                self.select_track_by_idx(cur + 1);
+                Some(self.current_id)
+            }
+            Some(_) if self.repeat => {
+                self.select_track_by_idx(0);
+                Some(self.current_id)
+            }
+            Some(_) => {
+                self.transport_state = TransportState::Stopped;
+                None
+            }
+        }
+    }
+
+    fn advance_previous(&mut self) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        if self.shuffle {
+            if self.shuffle_order.len() != self.tracks.len() {
+                self.rebuild_shuffle_order();
+            }
+            let prev_id = match self
+                .shuffle_order
+                .iter()
+                .position(|&id| id == self.current_id)
+            {
+                None => {
+                    if self.repeat {
+                        self.shuffle_order.last().copied()
+                    } else {
+                        self.shuffle_order.first().copied()
+                    }
+                }
+                Some(cur) if cur > 0 => Some(self.shuffle_order[cur - 1]),
+                Some(_) if self.repeat => self.shuffle_order.last().copied(),
+                Some(_) => {
+                    self.time.seconds = 0;
+                    return;
+                }
+            };
+            if let Some(id) = prev_id {
+                let _ = self.select_track_by_id(id);
+            }
+            return;
+        }
+
+        match self.tracks.iter().position(|t| t.id == self.current_id) {
+            None => {
+                let target = if self.repeat {
+                    self.tracks.len() - 1
+                } else {
+                    0
+                };
+                self.select_track_by_idx(target);
+            }
+            Some(cur) if cur > 0 => self.select_track_by_idx(cur - 1),
+            Some(_) if self.repeat => {
+                let last = self.tracks.len() - 1;
+                self.select_track_by_idx(last);
+            }
+            Some(_) => self.time.seconds = 0,
+        }
     }
 }
 
@@ -229,6 +369,8 @@ impl MemoryRenderer {
             transport_state: TransportState::Stopped,
             repeat: false,
             shuffle: false,
+            shuffle_order: Vec::new(),
+            shuffle_seed: 0x9E37_79B9_7F4A_7C15,
             playlist_protocol_info: DEFAULT_PLAYLIST_PROTOCOL_INFO.into(),
             counters: InfoCounters::default(),
             current_uri: String::new(),
@@ -318,6 +460,27 @@ impl MemoryRenderer {
     /// Update current `Receiver` (Songcast) transport state.
     pub fn set_receiver_state(&self, state: ReceiverState) {
         self.inner.write().unwrap().receiver_state = state;
+    }
+
+    /// Update `Product.Attributes` (e.g. disabling `Sender` when no `SenderService` is registered).
+    pub fn set_attributes(&self, attributes: DeviceAttributes) {
+        self.inner.write().unwrap().attributes = attributes;
+    }
+
+    /// Customize `Playlist.ProtocolInfo` to match the audio formats supported by the backend.
+    pub fn set_playlist_protocol_info(&self, protocol_info: impl Into<String>) {
+        self.inner.write().unwrap().playlist_protocol_info = protocol_info.into();
+    }
+
+    /// Atomically advance to the next playlist track on clean end-of-stream (respecting
+    /// `Repeat` and `Shuffle`). Returns `Some(next_id)` if playback should continue, or
+    /// `None` if the playlist ended and transitioned to `Stopped`.
+    pub fn advance_on_track_end(&self) -> Option<u32> {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.is_source_type_active(&SourceType::Playlist) {
+            return None;
+        }
+        inner.advance_next()
     }
 
     /// Update current `Info` track URI and DIDL-Lite metadata (increments `TrackCount`).
@@ -424,7 +587,10 @@ impl PlaylistService for MemoryRenderer {
     fn pause(&self) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
         inner.require_playlist_active()?;
-        if inner.transport_state == TransportState::Playing {
+        if matches!(
+            inner.transport_state,
+            TransportState::Playing | TransportState::Buffering
+        ) {
             inner.transport_state = TransportState::Paused;
         }
         Ok(())
@@ -441,40 +607,14 @@ impl PlaylistService for MemoryRenderer {
     fn next(&self) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
         inner.require_playlist_active()?;
-        if inner.tracks.is_empty() {
-            return Ok(());
-        }
-        match inner.tracks.iter().position(|t| t.id == inner.current_id) {
-            None => inner.select_track_by_idx(0),
-            Some(cur) if cur + 1 < inner.tracks.len() => inner.select_track_by_idx(cur + 1),
-            Some(_) if inner.repeat => inner.select_track_by_idx(0),
-            Some(_) => inner.transport_state = TransportState::Stopped,
-        }
+        let _ = inner.advance_next();
         Ok(())
     }
 
     fn previous(&self) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
         inner.require_playlist_active()?;
-        if inner.tracks.is_empty() {
-            return Ok(());
-        }
-        match inner.tracks.iter().position(|t| t.id == inner.current_id) {
-            None => {
-                let target = if inner.repeat {
-                    inner.tracks.len() - 1
-                } else {
-                    0
-                };
-                inner.select_track_by_idx(target);
-            }
-            Some(cur) if cur > 0 => inner.select_track_by_idx(cur - 1),
-            Some(_) if inner.repeat => {
-                let last = inner.tracks.len() - 1;
-                inner.select_track_by_idx(last);
-            }
-            Some(_) => inner.time.seconds = 0,
-        }
+        inner.advance_previous();
         Ok(())
     }
 
@@ -497,6 +637,11 @@ impl PlaylistService for MemoryRenderer {
         let mut inner = self.inner.write().unwrap();
         inner.require_playlist_active()?;
         inner.shuffle = value;
+        if value {
+            inner.rebuild_shuffle_order();
+        } else {
+            inner.shuffle_order.clear();
+        }
         Ok(())
     }
 
@@ -637,6 +782,9 @@ impl PlaylistService for MemoryRenderer {
         );
         inner.total_track_bytes = inner.total_track_bytes.saturating_add(entry_bytes);
         inner.id_array_token = inner.id_array_token.wrapping_add(1);
+        if inner.shuffle {
+            inner.shuffle_order.push(new_id);
+        }
         Ok(new_id)
     }
 
@@ -652,6 +800,7 @@ impl PlaylistService for MemoryRenderer {
             .total_track_bytes
             .saturating_sub(removed.uri.len() + removed.metadata.len());
         inner.id_array_token = inner.id_array_token.wrapping_add(1);
+        inner.shuffle_order.retain(|&tid| tid != id);
         if inner.current_id == id {
             if inner.tracks.is_empty() {
                 inner.clear_current_track();
@@ -668,6 +817,7 @@ impl PlaylistService for MemoryRenderer {
         let mut inner = self.inner.write().unwrap();
         let had_tracks = !inner.tracks.is_empty();
         inner.tracks.clear();
+        inner.shuffle_order.clear();
         inner.total_track_bytes = 0;
         inner.clear_current_track();
         inner.transport_state = TransportState::Stopped;

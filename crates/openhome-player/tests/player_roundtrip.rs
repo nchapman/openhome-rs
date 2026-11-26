@@ -154,9 +154,16 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
 
     assert_eq!(product.product().await.unwrap().room, "Studio");
     assert_eq!(product.source_count().await.unwrap(), 2);
-    assert!(product.attributes().await.unwrap().info);
+    let attrs = product.attributes().await.unwrap();
+    assert!(attrs.info && attrs.time && attrs.volume && attrs.receiver);
+    assert!(
+        !attrs.sender,
+        "Sender must not be advertised without SenderService"
+    );
     assert_eq!(product.source_xml_change_count().await.unwrap(), 0);
-    assert!(!playlist.protocol_info().await.unwrap().is_empty());
+    let proto = playlist.protocol_info().await.unwrap();
+    assert!(!proto.contains("audio/L16"));
+    assert!(proto.contains("audio/aiff"));
     assert!(playlist.tracks_max().await.unwrap() > 0);
     assert!(!receiver.protocol_info().await.unwrap().is_empty());
     assert_eq!(receiver.sender().await.unwrap().0, "");
@@ -164,6 +171,20 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
     assert_eq!(volume.characteristics().await.unwrap().volume_max, 100);
     volume.set_balance(0).await.unwrap();
     volume.set_fade(0).await.unwrap();
+
+    // Security: local file URIs must be rejected by Playlist.Insert by default.
+    assert!(
+        playlist
+            .insert(0, "file:///etc/passwd", "<DIDL-Lite/>")
+            .await
+            .is_err()
+    );
+    assert!(
+        playlist
+            .insert(0, "/etc/passwd", "<DIDL-Lite/>")
+            .await
+            .is_err()
+    );
 
     // Full volume so decoded samples retain strong amplitude.
     volume.set_volume(100).await.unwrap();
@@ -275,7 +296,12 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(recovered, "expected clean recovery to Stopped on 404 URI");
+    assert!(
+        recovered,
+        "expected clean recovery to Stopped on 404 URI, got {:?}, track={:?}",
+        playlist.transport_state().await.unwrap(),
+        info.track().await.unwrap(),
+    );
 
     product.set_source_index(1).await.unwrap();
     product.set_standby(true).await.unwrap();
@@ -374,6 +400,22 @@ async fn songcast_receiver_streams_pcm_and_metadata_to_capture_sink() {
         ReceiverState::Playing
     );
 
+    // Send Songcast HALT frame -> Receiver transitions to Waiting, then resumes Playing on audio.
+    let _ = sender.send_audio(&audio_cfg, Vec::new(), true).await;
+    let mut saw_waiting = false;
+    for _ in 0..80 {
+        if receiver.transport_state().await.unwrap() == ReceiverState::Waiting {
+            saw_waiting = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    assert!(
+        saw_waiting,
+        "expected ReceiverState::Waiting on Songcast HALT"
+    );
+
+    // Shutting down on current_thread Tokio runtime with active Songcast must NOT deadlock.
     receiver.stop().await.unwrap();
     assert_eq!(
         receiver.transport_state().await.unwrap(),
@@ -425,10 +467,13 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
     std::fs::write(&path, &wav).unwrap();
     let uri = format!("file://{}", path.display());
 
-    // 1. Failing sink on open() -> EngineEvent::Error
-    let (engine, mut ev_rx) = PlaybackEngine::spawn(
+    // 1. Failing sink on open() -> EngineEvent::Error (with allow_local_files = true)
+    let (engine, mut ev_rx) = PlaybackEngine::spawn_with_options(
         Arc::new(FailingSink { fail_on_open: true }),
         tokio::runtime::Handle::current(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        true,
+        openhome_core::types::VolumeCharacteristics::default(),
     );
     assert!(format!("{engine:?}").contains("PlaybackEngine"));
     engine.send(EngineCommand::Load {
@@ -466,11 +511,14 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
     engine.shutdown();
 
     // 3. Failing sink on write() -> EngineEvent::Error
-    let (engine2, mut ev_rx2) = PlaybackEngine::spawn(
+    let (engine2, mut ev_rx2) = PlaybackEngine::spawn_with_options(
         Arc::new(FailingSink {
             fail_on_open: false,
         }),
         tokio::runtime::Handle::current(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        true,
+        openhome_core::types::VolumeCharacteristics::default(),
     );
     engine2.send(EngineCommand::Load {
         generation: 1,
@@ -503,4 +551,227 @@ async fn engine_error_paths_sink_failures_and_drop_cleanup() {
     drop(player);
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn paused_next_loads_new_track_and_current_thread_songcast_shutdown_does_not_deadlock() {
+    let wav1 = synth_wav(44_100, 44_100, 0.8); // 1.0s at 44.1kHz
+    let wav2 = synth_wav(48_000, 4_800, 0.8); // 0.1s at 48kHz
+    let (http_addr, http_task) = spawn_wav_http_server(wav1, wav2).await;
+
+    struct PacedCapture(Arc<CaptureSink>);
+    impl AudioSink for PacedCapture {
+        fn name(&self) -> &str {
+            "paced-capture"
+        }
+        fn open(&self, spec: PcmSpec) -> Result<Box<dyn SinkStream>, PlayerError> {
+            struct Stream(Box<dyn SinkStream>);
+            impl SinkStream for Stream {
+                fn spec(&self) -> PcmSpec {
+                    self.0.spec()
+                }
+                fn write(&mut self, samples: &[f32]) -> Result<(), PlayerError> {
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.0.write(samples)
+                }
+                fn flush(&mut self) {
+                    self.0.flush();
+                }
+            }
+            Ok(Box::new(Stream(self.0.open(spec)?)))
+        }
+    }
+
+    let capture = Arc::new(CaptureSink::new());
+    let player = OpenHomePlayer::start(PlayerConfig {
+        room: "Den".into(),
+        name: "State Test".into(),
+        bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        advertise_host: Some("127.0.0.1".into()),
+        songcast_interface: Ipv4Addr::LOCALHOST,
+        sink: Arc::new(PacedCapture(Arc::clone(&capture))),
+        ..PlayerConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let dev = OpenHomeDevice::connect(player.description_url())
+        .await
+        .unwrap();
+    let playlist = dev.playlist().unwrap();
+    let receiver = dev.receiver().unwrap();
+
+    let id1 = playlist
+        .insert(0, &format!("http://{http_addr}/track1.wav"), "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    let _id2 = playlist
+        .insert(
+            id1,
+            &format!("http://{http_addr}/track2.wav"),
+            "<DIDL-Lite/>",
+        )
+        .await
+        .unwrap();
+
+    // Seek to track 1, wait for it to start, pause, advance Next while paused, then Play -> must load 48kHz track 2.
+    playlist.seek_id(id1).await.unwrap();
+    let started_44k = wait_until(Duration::from_secs(3), || {
+        capture
+            .frames()
+            .iter()
+            .any(|f| f.spec == PcmSpec::new(44_100, 2, 16))
+    })
+    .await;
+    assert!(started_44k);
+    playlist.pause().await.unwrap();
+    capture.clear();
+    playlist.next().await.unwrap();
+    playlist.play().await.unwrap();
+
+    let played_48k = wait_until(Duration::from_secs(5), || {
+        capture
+            .frames()
+            .iter()
+            .any(|f| f.spec == PcmSpec::new(48_000, 2, 16))
+    })
+    .await;
+    assert!(
+        played_48k,
+        "Play after Next-while-Paused must load track 2 (48kHz)"
+    );
+
+    // Exercise Previous at index 0 (Seek(0) without reload), DeleteId of currently playing track,
+    // and Next on last track (Repeat=false -> Stopped).
+    playlist.seek_id(id1).await.unwrap();
+    let started_again = wait_until(Duration::from_secs(3), || {
+        capture
+            .frames()
+            .iter()
+            .any(|f| f.spec == PcmSpec::new(44_100, 2, 16))
+    })
+    .await;
+    assert!(started_again);
+    playlist.previous().await.unwrap();
+    playlist.delete_id(id1).await.unwrap();
+    playlist.next().await.unwrap();
+    assert_eq!(
+        playlist.transport_state().await.unwrap(),
+        TransportState::Stopped
+    );
+
+    // Start active Songcast and test live SetSender reconnect + empty-URI stop + shutdown.
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        advertise_ip: Some(Ipv4Addr::LOCALHOST),
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+    let sc_uri = sender.uri().to_string();
+    receiver.set_sender(&sc_uri, "<DIDL-Lite/>").await.unwrap();
+    receiver.play().await.unwrap();
+    // Reconnect while active via SetSender with non-empty URI.
+    receiver.set_sender(&sc_uri, "<DIDL-Lite/>").await.unwrap();
+    // Empty URI stops active Songcast cleanly.
+    receiver.set_sender("", "").await.unwrap();
+    assert_eq!(
+        receiver.transport_state().await.unwrap(),
+        ReceiverState::Stopped
+    );
+    // Receiver.Play with empty sender URI stops any active Playlist cleanly.
+    receiver.play().await.unwrap();
+    receiver.set_sender(&sc_uri, "<DIDL-Lite/>").await.unwrap();
+    receiver.play().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), player.shutdown())
+        .await
+        .expect("shutdown with active Songcast must not deadlock current_thread runtime");
+    sender.shutdown().await;
+    http_task.abort();
+}
+
+#[tokio::test]
+async fn songcast_sink_open_and_write_errors_tear_down_without_storm() {
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        advertise_ip: Some(Ipv4Addr::LOCALHOST),
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+    let audio_cfg = AudioFormat::pcm(44_100, 16, 2);
+    let pcm_be = vec![0x10u8; 256 * 4];
+
+    // 1. FailingSink on open() during Songcast -> single Error, no error storm.
+    let (engine, mut ev_rx) = PlaybackEngine::spawn(
+        Arc::new(FailingSink { fail_on_open: true }),
+        tokio::runtime::Handle::current(),
+    );
+    engine.send(EngineCommand::StartSongcast {
+        generation: 1,
+        uri: sender.uri().to_string(),
+        interface: Ipv4Addr::LOCALHOST,
+    });
+    let mut saw_err = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let _ = sender.send_audio(&audio_cfg, pcm_be.clone(), false).await;
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(20), ev_rx.recv()).await
+            && matches!(
+                ev,
+                openhome_player::EngineEvent::Error { generation: 1, .. }
+            )
+        {
+            saw_err = true;
+            break;
+        }
+    }
+    assert!(
+        saw_err,
+        "expected EngineEvent::Error on Songcast sink.open() failure"
+    );
+    // Ensure no second error is spammed on subsequent audio packets.
+    let _ = sender.send_audio(&audio_cfg, pcm_be.clone(), false).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ev_rx.recv())
+            .await
+            .is_err(),
+        "Songcast must not spam errors after teardown"
+    );
+    engine.shutdown_async().await;
+
+    // 2. FailingSink on write() during Songcast -> Error + teardown.
+    let (engine2, mut ev_rx2) = PlaybackEngine::spawn(
+        Arc::new(FailingSink {
+            fail_on_open: false,
+        }),
+        tokio::runtime::Handle::current(),
+    );
+    engine2.send(EngineCommand::StartSongcast {
+        generation: 2,
+        uri: sender.uri().to_string(),
+        interface: Ipv4Addr::LOCALHOST,
+    });
+    let mut saw_write_err = false;
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline2 {
+        let _ = sender.send_audio(&audio_cfg, pcm_be.clone(), false).await;
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(20), ev_rx2.recv()).await
+            && matches!(
+                ev,
+                openhome_player::EngineEvent::Error { generation: 2, .. }
+            )
+        {
+            saw_write_err = true;
+            break;
+        }
+    }
+    assert!(
+        saw_write_err,
+        "expected EngineEvent::Error on Songcast sink.write() failure"
+    );
+    engine2.shutdown_async().await;
+
+    sender.shutdown().await;
 }

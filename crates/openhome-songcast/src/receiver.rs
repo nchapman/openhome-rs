@@ -301,6 +301,11 @@ impl SongcastReceiver {
         self.events_rx.recv().await
     }
 
+    /// Non-blocking poll for the next queued [`ReceiverEvent`].
+    pub fn try_recv(&mut self) -> Result<ReceiverEvent, mpsc::error::TryRecvError> {
+        self.events_rx.try_recv()
+    }
+
     /// Stop the receiver and (in unicast mode) send `OhmMessage::Leave`.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);

@@ -1,12 +1,13 @@
 //! High-level [`OpenHomePlayer`] bridging `openhome-server` services and [`PlaybackEngine`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use openhome_core::Fault;
 use openhome_core::types::{
-    DeviceAttributes, InfoCounters, ProductInfo, ReceiverState, Source, TrackDetails, TrackEntry,
-    TrackTime, TransportState, VolumeCharacteristics, VolumeState,
+    DeviceAttributes, InfoCounters, ProductInfo, ReceiverState, Source, SourceType, TrackDetails,
+    TrackEntry, TrackTime, TransportState, VolumeCharacteristics, VolumeState,
 };
 use openhome_server::{
     ActionResult, InfoService, MemoryRenderer, OpenHomeServer, PlaylistService, ProductService,
@@ -15,9 +16,26 @@ use openhome_server::{
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::decoder::is_http_uri;
 use crate::engine::{EngineCommand, EngineEvent, PlaybackEngine};
 use crate::error::PlayerError;
 use crate::sink::{AudioSink, NullSink};
+
+/// Exact UPnP `ProtocolInfo` list matching the codecs/containers enabled in `symphonia`.
+/// (Omits raw headerless `audio/L16` so media servers don't send unprobeable PCM.)
+const PLAYER_PROTOCOL_INFO: &str = "http-get:*:audio/flac:*,\
+http-get:*:audio/x-flac:*,\
+http-get:*:audio/mpeg:*,\
+http-get:*:audio/mp4:*,\
+http-get:*:audio/x-m4a:*,\
+http-get:*:audio/aac:*,\
+http-get:*:audio/alac:*,\
+http-get:*:audio/wav:*,\
+http-get:*:audio/x-wav:*,\
+http-get:*:audio/aiff:*,\
+http-get:*:audio/x-aiff:*,\
+http-get:*:audio/ogg:*,\
+http-get:*:application/ogg:*";
 
 /// Configuration for starting an [`OpenHomePlayer`].
 #[derive(Clone)]
@@ -36,6 +54,11 @@ pub struct PlayerConfig {
     pub ssdp: SsdpConfig,
     /// Local IPv4 interface for Songcast Receiver sockets.
     pub songcast_interface: Ipv4Addr,
+    /// Whether `Playlist.Insert` is allowed to open `file://` or local filesystem paths.
+    ///
+    /// Defaults to `false` (only `http://` and `https://` URIs are accepted) so unauthenticated
+    /// LAN callers cannot access local files or hang on special device nodes.
+    pub allow_local_files: bool,
     /// Audio output sink (`NullSink`, `CaptureSink`, or `CpalSink`).
     pub sink: Arc<dyn AudioSink>,
 }
@@ -46,6 +69,7 @@ impl std::fmt::Debug for PlayerConfig {
             .field("room", &self.room)
             .field("name", &self.name)
             .field("bind_addr", &self.bind_addr)
+            .field("allow_local_files", &self.allow_local_files)
             .field("sink", &self.sink.name())
             .finish()
     }
@@ -61,6 +85,7 @@ impl Default for PlayerConfig {
             advertise_host: None,
             ssdp: SsdpConfig::disabled(),
             songcast_interface: Ipv4Addr::UNSPECIFIED,
+            allow_local_files: false,
             sink: Arc::new(NullSink::realtime()),
         }
     }
@@ -69,26 +94,36 @@ impl Default for PlayerConfig {
 struct PlayerCore {
     state: MemoryRenderer,
     engine: PlaybackEngine,
-    generation: AtomicU64,
+    generation: Arc<AtomicU64>,
+    loaded_track_id: AtomicU32,
     songcast_interface: Ipv4Addr,
-    notifier: Mutex<Option<ServerNotifier>>,
+    allow_local_files: bool,
+    notifier: OnceLock<ServerNotifier>,
 }
 
 impl PlayerCore {
     fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.generation.load(Ordering::Acquire)
     }
 
     fn attach_notifier(&self, notifier: ServerNotifier) {
-        *self.notifier.lock().unwrap() = Some(notifier);
+        let _ = self.notifier.set(notifier);
+    }
+
+    fn is_playlist_active(&self) -> bool {
+        let idx = self.state.source_index() as usize;
+        self.state
+            .sources()
+            .get(idx)
+            .is_some_and(|s| s.source_type == SourceType::Playlist)
     }
 
     fn notify_playback(&self) {
-        if let Some(n) = self.notifier.lock().unwrap().as_ref() {
+        if let Some(n) = self.notifier.get() {
             n.notify_playlist();
             n.notify_info();
             n.notify_time();
@@ -96,21 +131,28 @@ impl PlayerCore {
     }
 
     fn notify_receiver_and_info(&self) {
-        if let Some(n) = self.notifier.lock().unwrap().as_ref() {
+        if let Some(n) = self.notifier.get() {
             n.notify_receiver();
             n.notify_info();
         }
+    }
+
+    fn stop_engine(&self) {
+        self.next_generation();
+        self.loaded_track_id.store(0, Ordering::Release);
+        self.engine.send(EngineCommand::Stop);
     }
 
     /// Start decoding the current playlist track (if any) in `PlaybackEngine`.
     fn load_current_track(&self, paused: bool) {
         let id = self.state.current_id();
         if id == 0 {
-            self.engine.send(EngineCommand::Stop);
+            self.stop_engine();
             return;
         }
         if let Ok(entry) = self.state.read(id) {
             let generation = self.next_generation();
+            self.loaded_track_id.store(id, Ordering::Release);
             self.engine.send(EngineCommand::Load {
                 generation,
                 uri: entry.uri,
@@ -138,12 +180,15 @@ impl PlayerCore {
                 self.state.set_track_details(details);
                 self.notify_playback();
             }
-            EngineEvent::Time { generation, time } => {
+            EngineEvent::Time {
+                generation,
+                seconds,
+            } => {
                 if generation != self.current_generation() {
                     return;
                 }
-                self.state.set_time_seconds(time.seconds);
-                if let Some(n) = self.notifier.lock().unwrap().as_ref() {
+                self.state.set_time_seconds(seconds);
+                if let Some(n) = self.notifier.get() {
                     n.notify_time();
                 }
             }
@@ -151,22 +196,20 @@ impl PlayerCore {
                 if generation != self.current_generation() {
                     return;
                 }
-                // Advance to next track if one exists (respecting Repeat/Shuffle); otherwise stop.
-                let prev_id = self.state.current_id();
-                let ids = self.state.id_array().1;
-                let can_advance = if let Some(pos) = ids.iter().position(|&id| id == prev_id) {
-                    pos + 1 < ids.len() || self.state.repeat()
-                } else {
-                    false
-                };
-
-                if can_advance && self.state.next().is_ok() {
+                if self.state.advance_on_track_end().is_some() {
                     self.load_current_track(false);
                 } else {
-                    let _ = PlaylistService::stop(&self.state);
+                    self.loaded_track_id.store(0, Ordering::Release);
                     self.engine.send(EngineCommand::Stop);
                 }
                 self.notify_playback();
+            }
+            EngineEvent::SongcastState { generation, state } => {
+                if generation != self.current_generation() {
+                    return;
+                }
+                self.state.set_receiver_state(state);
+                self.notify_receiver_and_info();
             }
             EngineEvent::SongcastTrack {
                 generation,
@@ -177,7 +220,6 @@ impl PlayerCore {
                     return;
                 }
                 self.state.set_info_track(uri, metadata);
-                self.state.set_receiver_state(ReceiverState::Playing);
                 self.notify_receiver_and_info();
             }
             EngineEvent::SongcastMetatext {
@@ -194,6 +236,7 @@ impl PlayerCore {
                 if generation != self.current_generation() {
                     return;
                 }
+                self.loaded_track_id.store(0, Ordering::Release);
                 let _ = PlaylistService::stop(&self.state);
                 self.state.set_receiver_state(ReceiverState::Stopped);
                 self.notify_playback();
@@ -224,8 +267,7 @@ impl ProductService for PlayerCore {
         let prev = self.state.source_index();
         self.state.set_source_index(index)?;
         if index != prev {
-            self.next_generation();
-            self.engine.send(EngineCommand::Stop);
+            self.stop_engine();
         }
         Ok(())
     }
@@ -237,8 +279,7 @@ impl ProductService for PlayerCore {
     fn set_standby(&self, standby: bool) -> ActionResult<()> {
         self.state.set_standby(standby)?;
         if standby {
-            self.next_generation();
-            self.engine.send(EngineCommand::Stop);
+            self.stop_engine();
         }
         Ok(())
     }
@@ -251,9 +292,13 @@ impl ProductService for PlayerCore {
 impl PlaylistService for PlayerCore {
     fn play(&self) -> ActionResult<()> {
         let was_paused = PlaylistService::transport_state(&self.state) == TransportState::Paused
-            && self.state.source_index() == 0;
+            && self.is_playlist_active();
         PlaylistService::play(&self.state)?;
-        if was_paused {
+        let current_id = self.state.current_id();
+        if was_paused
+            && current_id != 0
+            && self.loaded_track_id.load(Ordering::Acquire) == current_id
+        {
             self.engine.send(EngineCommand::Play);
         } else {
             self.load_current_track(false);
@@ -269,25 +314,44 @@ impl PlaylistService for PlayerCore {
 
     fn stop(&self) -> ActionResult<()> {
         PlaylistService::stop(&self.state)?;
-        self.next_generation();
-        self.engine.send(EngineCommand::Stop);
+        self.stop_engine();
         Ok(())
     }
 
     fn next(&self) -> ActionResult<()> {
         self.state.next()?;
-        let paused = PlaylistService::transport_state(&self.state) != TransportState::Playing;
-        if !paused {
-            self.load_current_track(false);
+        match PlaylistService::transport_state(&self.state) {
+            TransportState::Playing | TransportState::Buffering => self.load_current_track(false),
+            TransportState::Stopped => self.stop_engine(),
+            TransportState::Paused => {
+                // Invalidate loaded_track_id so a subsequent Play loads the newly selected track.
+                self.stop_engine();
+            }
         }
         Ok(())
     }
 
     fn previous(&self) -> ActionResult<()> {
+        let prev_id = self.state.current_id();
         self.state.previous()?;
-        let paused = PlaylistService::transport_state(&self.state) != TransportState::Playing;
-        if !paused {
-            self.load_current_track(false);
+        let new_id = self.state.current_id();
+        match PlaylistService::transport_state(&self.state) {
+            TransportState::Playing | TransportState::Buffering => {
+                if new_id != 0
+                    && new_id == prev_id
+                    && self.loaded_track_id.load(Ordering::Acquire) == new_id
+                {
+                    // At track 0 without repeat: restart track from 0s without re-downloading.
+                    self.engine.send(EngineCommand::Seek(0));
+                } else {
+                    self.load_current_track(false);
+                }
+            }
+            TransportState::Stopped | TransportState::Paused => {
+                if new_id != prev_id {
+                    self.stop_engine();
+                }
+            }
         }
         Ok(())
     }
@@ -350,6 +414,11 @@ impl PlaylistService for PlayerCore {
     }
 
     fn insert(&self, after_id: u32, uri: String, metadata: String) -> ActionResult<u32> {
+        if !self.allow_local_files && !is_http_uri(&uri) {
+            return Err(Fault::invalid_args(
+                "Only http:// and https:// track URIs are allowed",
+            ));
+        }
         self.state.insert(after_id, uri, metadata)
     }
 
@@ -357,16 +426,22 @@ impl PlaylistService for PlayerCore {
         let was_current = self.state.current_id() == id;
         self.state.delete_id(id)?;
         if was_current {
-            self.next_generation();
-            self.engine.send(EngineCommand::Stop);
+            if matches!(
+                PlaylistService::transport_state(&self.state),
+                TransportState::Playing | TransportState::Buffering
+            ) && self.state.current_id() != 0
+            {
+                self.load_current_track(false);
+            } else {
+                self.stop_engine();
+            }
         }
         Ok(())
     }
 
     fn delete_all(&self) -> ActionResult<()> {
         self.state.delete_all()?;
-        self.next_generation();
-        self.engine.send(EngineCommand::Stop);
+        self.stop_engine();
         Ok(())
     }
 
@@ -465,28 +540,51 @@ impl VolumeService for PlayerCore {
 
 impl ReceiverService for PlayerCore {
     fn play(&self) -> ActionResult<()> {
-        self.state.play_receiver()?;
+        ReceiverService::play(&self.state)?;
         let (uri, _) = self.state.sender();
+        self.loaded_track_id.store(0, Ordering::Release);
         if !uri.is_empty() {
+            // Enter Waiting until the first Songcast audio packet arrives.
+            self.state.set_receiver_state(ReceiverState::Waiting);
             let generation = self.next_generation();
             self.engine.send(EngineCommand::StartSongcast {
                 generation,
                 uri,
                 interface: self.songcast_interface,
             });
+        } else {
+            // Even without a sender URI, switching to Receiver stops any active Playlist audio.
+            self.stop_engine();
         }
         Ok(())
     }
 
     fn stop(&self) -> ActionResult<()> {
-        self.state.stop_receiver()?;
+        ReceiverService::stop(&self.state)?;
         self.next_generation();
         self.engine.send(EngineCommand::StopSongcast);
         Ok(())
     }
 
     fn set_sender(&self, uri: String, metadata: String) -> ActionResult<()> {
-        self.state.set_sender(uri, metadata)
+        let was_active = ReceiverService::transport_state(&self.state) != ReceiverState::Stopped;
+        self.state.set_sender(uri.clone(), metadata)?;
+        if was_active {
+            if uri.is_empty() {
+                self.next_generation();
+                self.state.set_receiver_state(ReceiverState::Stopped);
+                self.engine.send(EngineCommand::StopSongcast);
+            } else {
+                self.state.set_receiver_state(ReceiverState::Waiting);
+                let generation = self.next_generation();
+                self.engine.send(EngineCommand::StartSongcast {
+                    generation,
+                    uri,
+                    interface: self.songcast_interface,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn sender(&self) -> (String, String) {
@@ -499,21 +597,6 @@ impl ReceiverService for PlayerCore {
 
     fn transport_state(&self) -> ReceiverState {
         ReceiverService::transport_state(&self.state)
-    }
-}
-
-trait ReceiverStateExt {
-    fn play_receiver(&self) -> ActionResult<()>;
-    fn stop_receiver(&self) -> ActionResult<()>;
-}
-
-impl ReceiverStateExt for MemoryRenderer {
-    fn play_receiver(&self) -> ActionResult<()> {
-        ReceiverService::play(self)
-    }
-
-    fn stop_receiver(&self) -> ActionResult<()> {
-        ReceiverService::stop(self)
     }
 }
 
@@ -540,16 +623,36 @@ impl OpenHomePlayer {
     /// Start a new [`OpenHomePlayer`] with the given [`PlayerConfig`].
     pub async fn start(config: PlayerConfig) -> Result<Self, PlayerError> {
         let runtime = tokio::runtime::Handle::current();
-        let (engine, mut ev_rx) = PlaybackEngine::spawn(config.sink, runtime);
         let state = MemoryRenderer::new(&config.room, &config.name);
+        // Only advertise services we actually register (no SenderService).
+        state.set_attributes(DeviceAttributes {
+            info: true,
+            time: true,
+            volume: true,
+            sender: false,
+            receiver: true,
+            credentials: false,
+        });
+        state.set_playlist_protocol_info(PLAYER_PROTOCOL_INFO);
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let (engine, mut ev_rx) = PlaybackEngine::spawn_with_options(
+            config.sink,
+            runtime,
+            Arc::clone(&generation),
+            config.allow_local_files,
+            state.characteristics(),
+        );
         engine.send(EngineCommand::SetVolume(state.state()));
 
         let core = Arc::new(PlayerCore {
             state,
             engine,
-            generation: AtomicU64::new(0),
+            generation,
+            loaded_track_id: AtomicU32::new(0),
             songcast_interface: config.songcast_interface,
-            notifier: Mutex::new(None),
+            allow_local_files: config.allow_local_files,
+            notifier: OnceLock::new(),
         });
 
         let mut builder = OpenHomeServer::builder(Arc::clone(&core) as Arc<dyn ProductService>)
@@ -614,11 +717,11 @@ impl OpenHomePlayer {
 
     /// Gracefully shut down the HTTP/SSDP server, event pump, and audio playback worker.
     pub async fn shutdown(mut self) {
-        self.core.engine.send(EngineCommand::Shutdown);
         let _ = self.pump_stop_tx.send(true);
         if let Some(task) = self.pump_task.take() {
             let _ = task.await;
         }
+        self.core.engine.shutdown_async().await;
         if let Some(server) = self.server.take() {
             server.shutdown().await;
         }
