@@ -1379,6 +1379,7 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
 
     // Seek on Leader while grouped emits HALT so Follower flushes cleanly and resumes.
     leader_pl.seek_second_absolute(0).await.unwrap();
+    leader_pl.seek_second_relative(0).await.unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     // Skip to the 48 kHz track to exercise mid-stream sample-rate change on both Leader & Follower.
@@ -1418,6 +1419,21 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
         ReceiverState::Waiting
     );
     assert!(!sender_client.audio().await.unwrap());
+
+    // Re-pointing Receiver.SetSender while active restarts Songcast; clearing to empty stops it.
+    follower_rx
+        .set_sender(sender_uri, &sender_meta)
+        .await
+        .unwrap();
+    assert_eq!(
+        follower_rx.transport_state().await.unwrap(),
+        ReceiverState::Waiting
+    );
+    follower_rx.set_sender("", "").await.unwrap();
+    assert_eq!(
+        follower_rx.transport_state().await.unwrap(),
+        ReceiverState::Stopped
+    );
 
     // Stopping Follower and putting Leader in standby disables Leader's Sender.Status.
     follower_rx.stop().await.unwrap();

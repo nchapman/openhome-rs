@@ -219,6 +219,17 @@ mod tests {
         assert!(CliArgs::parse_from(["--unknown"]).is_err());
         assert!(CliArgs::parse_from(["--bind", "bad"]).is_err());
         assert!(CliArgs::parse_from(["--songcast-interface", "not-an-ip"]).is_err());
+        for flag in [
+            "--room",
+            "--name",
+            "--udn",
+            "--bind",
+            "--advertise-host",
+            "--songcast-interface",
+            "--device",
+        ] {
+            assert!(CliArgs::parse_from([flag]).is_err(), "{flag} needs value");
+        }
     }
 
     #[tokio::test]
