@@ -1,0 +1,17 @@
+[package]
+name = "openhome-integration-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+openhome-core.workspace = true
+openhome-server.workspace = true
+openhome-client.workspace = true
+openhome-songcast.workspace = true
+tokio.workspace = true

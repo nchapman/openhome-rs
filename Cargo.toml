@@ -5,6 +5,7 @@ members = [
     "crates/openhome-server",
     "crates/openhome-client",
     "crates/openhome-songcast",
+    "tests/integration",
 ]
 
 [workspace.package]
