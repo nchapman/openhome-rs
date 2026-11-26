@@ -7,13 +7,13 @@ rust-version.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Self-contained OpenHome Media + Songcast audio player powered by Symphonia and optional cpal output"
+description = "Self-contained OpenHome Media + Songcast audio player powered by Symphonia and cpal"
 
 [lints]
 workspace = true
 
 [features]
-default = []
+default = ["cpal-output"]
 cpal-output = ["dep:cpal"]
 
 [dependencies]

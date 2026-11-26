@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo run -p openhome-player --features cpal-output --example live_demo
+//! cargo run -p openhome-player --example live_demo
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};

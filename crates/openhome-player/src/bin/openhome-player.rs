@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```sh
-//! cargo run -p openhome-player --features cpal-output -- --room "Living Room" --name "OpenHome Player"
+//! cargo run -p openhome-player -- --room "Living Room" --name "OpenHome Player"
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

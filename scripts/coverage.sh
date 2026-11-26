@@ -13,7 +13,8 @@ LOW_FILE_WARN=85
 tmp_json="$(mktemp -t openhome-cov.XXXXXX.json)"
 trap 'rm -f "$tmp_json"' EXIT
 
-cargo llvm-cov --workspace --json --output-path "$tmp_json"
+# Disable optional hardware audio backend (cpal-output) for deterministic headless coverage.
+cargo llvm-cov --workspace --no-default-features --json --output-path "$tmp_json"
 
 jq -r \
   --argjson min_total "$MIN_TOTAL" \
