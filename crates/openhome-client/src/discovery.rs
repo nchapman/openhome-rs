@@ -87,7 +87,11 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
     if options.target_addr.ip().is_multicast() {
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(2);
-        if let Some(iface) = options.interface {
+        let iface = options
+            .interface
+            .filter(|ip| !ip.is_unspecified())
+            .or_else(default_outbound_ipv4);
+        if let Some(iface) = iface {
             let _ = sock.set_multicast_if_v4(&iface);
         }
     }
@@ -160,4 +164,15 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
     }
 
     Ok(devices)
+}
+
+/// Best-effort lookup of the host's primary outbound IPv4 interface so multicast
+/// sends succeed on macOS/BSD when no default multicast route exists on `0.0.0.0`.
+fn default_outbound_ipv4() -> Option<Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
 }

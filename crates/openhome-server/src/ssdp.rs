@@ -85,11 +85,16 @@ impl SsdpRunner {
         sock.bind(&SocketAddr::V4(bind_addr).into())?;
 
         if config.multicast_addr.ip().is_multicast() {
-            sock.join_multicast_v4(config.multicast_addr.ip(), &config.interface)?;
+            let iface = if config.interface.is_unspecified() {
+                default_outbound_ipv4().unwrap_or(Ipv4Addr::UNSPECIFIED)
+            } else {
+                config.interface
+            };
+            sock.join_multicast_v4(config.multicast_addr.ip(), &iface)?;
             let _ = sock.set_multicast_loop_v4(true);
             let _ = sock.set_multicast_ttl_v4(2);
-            if !config.interface.is_unspecified() {
-                let _ = sock.set_multicast_if_v4(&config.interface);
+            if !iface.is_unspecified() {
+                let _ = sock.set_multicast_if_v4(&iface);
             }
         }
         sock.set_nonblocking(true)?;
@@ -217,5 +222,14 @@ impl SsdpRunner {
                 let _ = self.socket.send_to(resp.as_bytes(), peer).await;
             }
         }
+    }
+}
+
+fn default_outbound_ipv4() -> Option<Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
     }
 }
