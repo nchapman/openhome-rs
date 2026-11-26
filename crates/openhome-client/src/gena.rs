@@ -7,16 +7,16 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
-use hyper::header::CONTENT_LENGTH;
+use hyper::header::{CONNECTION, CONTENT_LENGTH};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use openhome_core::gena::decode_propertyset;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -26,6 +26,10 @@ use crate::http::HttpClient;
 
 const MAX_NOTIFY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const CALLBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const CALLBACK_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_CALLBACK_CONNS: usize = 128;
+const CALLBACK_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A decoded GENA `NOTIFY` event delivered by an OpenHome service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,13 +268,17 @@ impl EventSubscription {
         if let Some(task) = self.renew_task.take() {
             let _ = task.await;
         }
+        // Send UNSUBSCRIBE before removing the local callback route so an in-flight
+        // NOTIFY does not receive 412 and race-cancel the subscription before UNSUBSCRIBE arrives.
+        let res = self
+            .http
+            .gena_unsubscribe(&self.event_sub_url, &self.sid)
+            .await;
         self.routes
             .write()
             .expect("EventListener lock poisoned")
             .remove(&self.token);
-        self.http
-            .gena_unsubscribe(&self.event_sub_url, &self.sid)
-            .await
+        res
     }
 }
 
@@ -336,7 +344,22 @@ async fn serve_callbacks(
     routes: RouteMap,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CALLBACK_CONNS));
+
     loop {
+        let permit = tokio::select! {
+            res = conn_limit.clone().acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+
         let accept = tokio::select! {
             res = listener.accept() => res,
             res = shutdown.changed() => {
@@ -348,17 +371,34 @@ async fn serve_callbacks(
         };
 
         let Ok((stream, _peer)) = accept else {
+            drop(permit);
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         };
         let routes = routes.clone();
+        let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let routes = routes.clone();
                 async move { Ok::<_, Infallible>(handle_notify(req, routes).await) }
             });
-            let _ = http1::Builder::new().serve_connection(io, svc).await;
+            let conn = http1::Builder::new()
+                .keep_alive(true)
+                .timer(TokioTimer::new())
+                .header_read_timeout(CALLBACK_HEADER_READ_TIMEOUT)
+                .serve_connection(io, svc);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                res = conn_shutdown.changed() => {
+                    if res.is_err() || *conn_shutdown.borrow() {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = tokio::time::timeout(CALLBACK_SHUTDOWN_DRAIN_TIMEOUT, conn).await;
+                    }
+                }
+            }
         });
     }
 }
@@ -387,10 +427,29 @@ async fn handle_notify(req: Request<Incoming>, routes: RouteMap) -> Response<Ful
         return empty_status(StatusCode::BAD_REQUEST);
     };
 
+    if let Some(cl) = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        && cl > MAX_NOTIFY_BODY_BYTES as u64
+    {
+        return empty_close_status(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     let limited = Limited::new(req.into_body(), MAX_NOTIFY_BODY_BYTES);
-    let body_bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return empty_status(StatusCode::BAD_REQUEST),
+    let body_bytes = match tokio::time::timeout(CALLBACK_BODY_READ_TIMEOUT, limited.collect()).await
+    {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(err)) => {
+            let status = if err.is::<LengthLimitError>() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return empty_close_status(status);
+        }
+        Err(_) => return empty_close_status(StatusCode::REQUEST_TIMEOUT),
     };
     let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
         return empty_status(StatusCode::BAD_REQUEST);
@@ -443,6 +502,15 @@ fn empty_status(status: StatusCode) -> Response<Full<Bytes>> {
         .header(CONTENT_LENGTH, "0")
         .body(Full::new(Bytes::new()))
         .expect("valid GENA response")
+}
+
+fn empty_close_status(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, "0")
+        .header(CONNECTION, "close")
+        .body(Full::new(Bytes::new()))
+        .expect("valid GENA close response")
 }
 
 fn resolve_local_host(ip: IpAddr) -> String {

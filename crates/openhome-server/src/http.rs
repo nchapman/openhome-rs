@@ -9,22 +9,27 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, SERVER};
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, SERVER};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use openhome_core::gena::{format_timeout_header, parse_callback_header, parse_timeout_header};
 use openhome_core::soap::encode_fault;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::dispatch::ServiceRegistry;
 use crate::event::{EventHub, SubscribeError};
 
 const MAX_SOAP_BODY_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum time allowed to read a single SOAP request body (guards against slowloris peers).
+/// Maximum time allowed to read HTTP request headers or a single SOAP request body.
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SOAP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum concurrent accepted TCP connections (guards against FD/task exhaustion).
+const MAX_CONCURRENT_CONNS: usize = 128;
+/// Maximum time to wait for in-flight connections to drain during server shutdown.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
@@ -39,7 +44,22 @@ pub(crate) async fn serve_http(
     state: HttpState,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
+
     loop {
+        let permit = tokio::select! {
+            res = conn_limit.clone().acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+
         let accept = tokio::select! {
             res = listener.accept() => res,
             res = shutdown.changed() => {
@@ -51,7 +71,8 @@ pub(crate) async fn serve_http(
         };
 
         let Ok((stream, peer)) = accept else {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            drop(permit);
+            tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         };
 
@@ -59,6 +80,7 @@ pub(crate) async fn serve_http(
         let state = state.clone();
         let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let state = state.clone();
@@ -67,6 +89,8 @@ pub(crate) async fn serve_http(
 
             let conn = http1::Builder::new()
                 .keep_alive(true)
+                .timer(TokioTimer::new())
+                .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
                 .serve_connection(io, svc);
             tokio::pin!(conn);
             tokio::select! {
@@ -74,7 +98,7 @@ pub(crate) async fn serve_http(
                 res = conn_shutdown.changed() => {
                     if res.is_err() || *conn_shutdown.borrow() {
                         conn.as_mut().graceful_shutdown();
-                        let _ = conn.await;
+                        let _ = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, conn).await;
                     }
                 }
             }
@@ -157,10 +181,10 @@ async fn handle_soap(
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        && cl > MAX_SOAP_BODY_BYTES
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        && cl > MAX_SOAP_BODY_BYTES as u64
     {
-        return empty_response(StatusCode::PAYLOAD_TOO_LARGE, &state.server_header);
+        return empty_close_response(StatusCode::PAYLOAD_TOO_LARGE, &state.server_header);
     }
 
     let soap_action = req
@@ -178,9 +202,9 @@ async fn handle_soap(
             } else {
                 StatusCode::BAD_REQUEST
             };
-            return empty_response(status, &state.server_header);
+            return empty_close_response(status, &state.server_header);
         }
-        Err(_) => return empty_response(StatusCode::REQUEST_TIMEOUT, &state.server_header),
+        Err(_) => return empty_close_response(StatusCode::REQUEST_TIMEOUT, &state.server_header),
     };
     let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
         return empty_response(StatusCode::BAD_REQUEST, &state.server_header);
@@ -353,4 +377,16 @@ fn empty_response(status: StatusCode, server_header: &str) -> Response<Full<Byte
         .header(CONTENT_LENGTH, "0")
         .body(Full::new(Bytes::new()))
         .expect("valid empty response")
+}
+
+/// Empty error response that closes the connection when the request body was not drained
+/// (RFC 9112 §9.6).
+fn empty_close_response(status: StatusCode, server_header: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(SERVER, server_header)
+        .header(CONTENT_LENGTH, "0")
+        .header(CONNECTION, "close")
+        .body(Full::new(Bytes::new()))
+        .expect("valid empty close response")
 }

@@ -17,6 +17,7 @@ use crate::ohm::{OhmAudio, OhmMessage, OhmMetatext, OhmTrack};
 use crate::reorder::{
     DEFAULT_MAX_BACKLOG_FRAMES, MAX_RESEND_FRAMES_PER_REQ, PushOutcome, ReorderBuffer,
 };
+use crate::sender::MAX_SLAVES;
 use crate::uri::SongcastUri;
 use crate::zone::{bind_udp_v4, resolve_zone_on};
 
@@ -183,12 +184,15 @@ impl SongcastReceiver {
                         }
                     }
                     recv = socket.recv_from(&mut buf) => {
-                        let Ok((len, _peer)) = recv else { continue };
+                        let Ok((len, peer)) = recv else { continue };
                         let arrival = Instant::now();
                         let Ok(msg) = OhmMessage::decode(&buf[..len]) else { continue };
 
                         match msg {
-                            OhmMessage::Slave(list) if !is_multicast => {
+                            OhmMessage::Slave(mut list) if !is_multicast && peer == dest => {
+                                // Only accept Slave relay lists from the unicast sender itself,
+                                // bounded to MAX_SLAVES to prevent UDP reflection/amplification.
+                                list.truncate(MAX_SLAVES);
                                 slaves = list;
                             }
                             OhmMessage::Track(track) => {

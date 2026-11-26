@@ -1,7 +1,7 @@
 //! Property-based and fuzz tests covering every zero-network wire parser, codec,
-//! and stateful protocol engine in `openhome-core` and `openhome-songcast`.
+//! and stateful protocol engine in `openhome-core`, `openhome-songcast`, and `openhome-server`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
@@ -15,12 +15,13 @@ use openhome_core::soap::{
     encode_action_response, encode_fault, parse_soapaction_header,
 };
 use openhome_core::ssdp::decode_ssdp_packet;
-use openhome_core::types::{Source, SourceType, TrackEntry};
+use openhome_core::types::{DeviceDescription, ServiceDescription, Source, SourceType, TrackEntry};
 use openhome_core::urn::SERVICE_PLAYLIST_1;
 use openhome_core::xml::{
-    decode_device_description, decode_source_xml, decode_track_list, encode_source_xml,
-    encode_track_list, parse_id_list,
+    decode_device_description, decode_source_xml, decode_track_list, encode_device_description,
+    encode_source_xml, encode_track_list, parse_id_list,
 };
+use openhome_server::{MemoryRenderer, PlaylistService, ProductService, VolumeService};
 use openhome_songcast::{
     AudioFlags, ClockSync, MAX_RESEND_FRAMES_PER_REQ, OhmAudio, OhmMessage, OhmMetatext, OhmTrack,
     OhzMessage, PushOutcome, ReorderBuffer, SongcastUri,
@@ -32,7 +33,7 @@ fn xml_ident() -> impl Strategy<Value = String> {
     "[A-Za-z][A-Za-z0-9_]{0,15}".prop_map(String::from)
 }
 
-/// Safe XML text (no NUL or forbidden XML 1.0 control chars, but includes `<>&"'` and Unicode).
+/// Safe XML text (no NUL or forbidden XML 1.0 control chars, includes `<>&"'` and Unicode).
 fn xml_text() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![
@@ -60,6 +61,48 @@ fn socket_v4_strategy() -> impl Strategy<Value = SocketAddrV4> {
     (ipv4_strategy(), any::<u16>()).prop_map(|(ip, port)| SocketAddrV4::new(ip, port))
 }
 
+#[derive(Debug, Clone)]
+enum RendererOp {
+    Insert { after_slot: usize, uri: String },
+    DeleteSlot(usize),
+    DeleteAll,
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Previous,
+    SeekIndex(u32),
+    SetRepeat(bool),
+    SetShuffle(bool),
+    SetStandby(bool),
+    SetSourceIndex(u32),
+    SetVolume(u32),
+    SetMute(bool),
+}
+
+fn renderer_op_strategy() -> impl Strategy<Value = RendererOp> {
+    prop_oneof![
+        (0usize..8, "[a-z0-9]{1,12}").prop_map(|(after_slot, s)| RendererOp::Insert {
+            after_slot,
+            uri: format!("http://m/{s}.flac")
+        }),
+        (0usize..8).prop_map(RendererOp::DeleteSlot),
+        Just(RendererOp::DeleteAll),
+        Just(RendererOp::Play),
+        Just(RendererOp::Pause),
+        Just(RendererOp::Stop),
+        Just(RendererOp::Next),
+        Just(RendererOp::Previous),
+        (0u32..10).prop_map(RendererOp::SeekIndex),
+        any::<bool>().prop_map(RendererOp::SetRepeat),
+        any::<bool>().prop_map(RendererOp::SetShuffle),
+        any::<bool>().prop_map(RendererOp::SetStandby),
+        (0u32..4).prop_map(RendererOp::SetSourceIndex),
+        (0u32..120).prop_map(RendererOp::SetVolume),
+        any::<bool>().prop_map(RendererOp::SetMute),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
@@ -69,11 +112,14 @@ proptest! {
     })]
 
     // -----------------------------------------------------------------------
-    // 1. openhome-core: never-panic fuzzing on arbitrary strings
+    // 1. openhome-core: never-panic fuzzing on arbitrary strings & raw bytes
     // -----------------------------------------------------------------------
 
     #[test]
-    fn core_parsers_never_panic_on_arbitrary_input(s in "\\PC{0,256}") {
+    fn core_parsers_never_panic_on_arbitrary_input(
+        s in "\\PC{0,256}",
+        raw_bytes in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
         let _ = decode_soap_args(&s);
         let _ = decode_soap_response(&s);
         let _ = decode_soap_fault(&s);
@@ -87,6 +133,7 @@ proptest! {
         let _ = parse_callback_header(&s);
         let _ = parse_timeout_header(&s);
         let _ = decode_ssdp_packet(s.as_bytes());
+        let _ = decode_ssdp_packet(&raw_bytes);
     }
 
     // -----------------------------------------------------------------------
@@ -103,6 +150,7 @@ proptest! {
         let req_xml = encode_action_request(SERVICE_PLAYLIST_1, &action, &pairs);
         let (dec_action, dec_args) = decode_soap_args(&req_xml).unwrap();
         prop_assert_eq!(dec_action, action.clone());
+        prop_assert_eq!(dec_args.len(), args.len());
         for (k, v) in &args {
             prop_assert_eq!(dec_args.get(k).map(String::as_str), Some(v.as_str()));
         }
@@ -110,6 +158,7 @@ proptest! {
         let resp_xml = encode_action_response(SERVICE_PLAYLIST_1, &action, &pairs);
         let (resp_action, resp_args) = decode_soap_response(&resp_xml).unwrap();
         prop_assert_eq!(resp_action, format!("{action}Response"));
+        prop_assert_eq!(resp_args.len(), args.len());
         for (k, v) in &args {
             prop_assert_eq!(resp_args.get(k).map(String::as_str), Some(v.as_str()));
         }
@@ -131,7 +180,7 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 3. openhome-core: IdArray, GENA propertyset, SourceXml, TrackList round-trips
+    // 3. openhome-core: IdArray, GENA, SourceXml, TrackList, DeviceDescription
     // -----------------------------------------------------------------------
 
     #[test]
@@ -172,7 +221,6 @@ proptest! {
             .collect();
         let src_xml = encode_source_xml(&src_objs);
         let dec_src = decode_source_xml(&src_xml).unwrap();
-        // Per Product:1 interop, empty SystemName defaults to Name during decode.
         let expected_src: Vec<Source> = src_objs
             .into_iter()
             .map(|mut s| {
@@ -193,33 +241,93 @@ proptest! {
         prop_assert_eq!(dec_tracks, track_objs);
     }
 
+    #[test]
+    fn device_description_roundtrip(
+        friendly_name in "[A-Za-z0-9 _-]{1,24}",
+        manufacturer in "[A-Za-z0-9 _-]{1,24}",
+        model_name in "[A-Za-z0-9 _-]{1,24}",
+        udn_suffix in "[a-f0-9]{8}",
+    ) {
+        let desc = DeviceDescription {
+            udn: format!("uuid:{udn_suffix}"),
+            device_type: "urn:av-openhome-org:device:Source:1".into(),
+            friendly_name,
+            manufacturer,
+            manufacturer_url: None,
+            model_name,
+            model_description: None,
+            model_number: None,
+            model_url: None,
+            serial_number: None,
+            presentation_url: None,
+            url_base: Some("http://127.0.0.1:8080/".into()),
+            services: vec![ServiceDescription {
+                service_type: SERVICE_PLAYLIST_1.into(),
+                service_id: "urn:av-openhome-org:serviceId:Playlist".into(),
+                scpd_url: "/scpd/Playlist.xml".into(),
+                control_url: "/ctl/Playlist".into(),
+                event_sub_url: "/evt/Playlist".into(),
+            }],
+        };
+        let xml = encode_device_description(&desc);
+        let decoded = decode_device_description(&xml).unwrap();
+        prop_assert_eq!(decoded.udn, desc.udn);
+        prop_assert_eq!(decoded.friendly_name, desc.friendly_name.trim());
+        prop_assert_eq!(decoded.manufacturer, desc.manufacturer.trim());
+        prop_assert_eq!(decoded.model_name, desc.model_name.trim());
+        prop_assert_eq!(decoded.services.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
-    // 4. openhome-songcast: OHM / OHZ / URI never-panic fuzzing (raw + magic-prefixed)
+    // 4. openhome-songcast: biased OHM / OHZ / Audio payload fuzzing
     // -----------------------------------------------------------------------
 
     #[test]
-    fn songcast_decoders_never_panic_on_arbitrary_bytes(
+    fn songcast_decoders_never_panic_on_arbitrary_and_structured_bytes(
         raw in prop::collection::vec(any::<u8>(), 0..512),
-        msg_type in any::<u8>(),
-        len_be in any::<u16>(),
+        ohm_type in prop_oneof![0u8..=7u8, any::<u8>()],
+        ohz_type in prop_oneof![0u8..=3u8, any::<u8>()],
+        exact_len in any::<bool>(),
+        rand_len in any::<u16>(),
     ) {
         let _ = OhmMessage::decode(&raw);
         let _ = OhzMessage::decode(&raw);
 
-        // Also test magic-prefixed packets to penetrate past header checks into every branch.
+        let total_len = if exact_len {
+            (8 + raw.len()).min(u16::MAX as usize) as u16
+        } else {
+            rand_len
+        };
+
+        // Magic-prefixed OHM packet with biased valid msg_type & exact length to reach all payload decoders.
         let mut ohm_pkt = Vec::with_capacity(8 + raw.len());
         ohm_pkt.extend_from_slice(b"Ohm ");
         ohm_pkt.push(1);
-        ohm_pkt.push(msg_type);
-        ohm_pkt.extend_from_slice(&len_be.to_be_bytes());
+        ohm_pkt.push(ohm_type);
+        ohm_pkt.extend_from_slice(&total_len.to_be_bytes());
         ohm_pkt.extend_from_slice(&raw);
         let _ = OhmMessage::decode(&ohm_pkt);
 
+        // Dedicated OhmAudio subheader-penetration case (header_bytes=50, reserved=0).
+        if raw.len() >= 50 {
+            let mut audio_pkt = Vec::with_capacity(8 + raw.len());
+            audio_pkt.extend_from_slice(b"Ohm ");
+            audio_pkt.push(1);
+            audio_pkt.push(3); // Audio
+            audio_pkt.extend_from_slice(&((8 + raw.len()) as u16).to_be_bytes());
+            let start = audio_pkt.len();
+            audio_pkt.extend_from_slice(&raw);
+            audio_pkt[start] = 50; // OHM_AUDIO_SUBHEADER_BYTES
+            audio_pkt[start + 48] = 0; // reserved
+            let _ = OhmMessage::decode(&audio_pkt);
+        }
+
+        // Magic-prefixed OHZ packet with biased valid msg_type & exact length.
         let mut ohz_pkt = Vec::with_capacity(8 + raw.len());
         ohz_pkt.extend_from_slice(b"Ohz ");
         ohz_pkt.push(1);
-        ohz_pkt.push(msg_type);
-        ohz_pkt.extend_from_slice(&len_be.to_be_bytes());
+        ohz_pkt.push(ohz_type);
+        ohz_pkt.extend_from_slice(&total_len.to_be_bytes());
         ohz_pkt.extend_from_slice(&raw);
         let _ = OhzMessage::decode(&ohz_pkt);
     }
@@ -255,6 +363,10 @@ proptest! {
         ts in any::<u32>(),
         latency in any::<u32>(),
         flags_bits in any::<u8>(),
+        vol_offset in any::<i16>(),
+        sample_start in any::<u64>(),
+        samples_total in any::<u64>(),
+        codec in "[A-Za-z0-9]{0,16}",
         audio in prop::collection::vec(any::<u8>(), 0..128),
         uri in "\\PC{0,64}",
         metadata in "\\PC{0,64}",
@@ -269,14 +381,14 @@ proptest! {
             network_timestamp: ts,
             media_latency: latency,
             media_timestamp: ts.wrapping_add(100),
-            sample_start: 0,
-            samples_total: 0,
+            sample_start,
+            samples_total,
             sample_rate: 48_000,
             bit_rate: 1_536_000,
-            volume_offset: 0,
+            volume_offset: vol_offset,
             bit_depth: 16,
             channels: 2,
-            codec: "PCM".into(),
+            codec,
             audio,
         });
         let encoded = audio_msg.encode().unwrap();
@@ -287,23 +399,19 @@ proptest! {
             uri,
             metadata,
         });
-        let enc_t = track_msg.encode().unwrap();
-        prop_assert_eq!(OhmMessage::decode(&enc_t).unwrap(), track_msg);
+        prop_assert_eq!(OhmMessage::decode(&track_msg.encode().unwrap()).unwrap(), track_msg);
 
         let meta_msg = OhmMessage::Metatext(OhmMetatext {
             sequence: frame,
             metatext,
         });
-        let enc_m = meta_msg.encode().unwrap();
-        prop_assert_eq!(OhmMessage::decode(&enc_m).unwrap(), meta_msg);
+        prop_assert_eq!(OhmMessage::decode(&meta_msg.encode().unwrap()).unwrap(), meta_msg);
 
         let slave_msg = OhmMessage::Slave(slaves);
-        let enc_s = slave_msg.encode().unwrap();
-        prop_assert_eq!(OhmMessage::decode(&enc_s).unwrap(), slave_msg);
+        prop_assert_eq!(OhmMessage::decode(&slave_msg.encode().unwrap()).unwrap(), slave_msg);
 
         let resend_msg = OhmMessage::Resend(resend);
-        let enc_r = resend_msg.encode().unwrap();
-        prop_assert_eq!(OhmMessage::decode(&enc_r).unwrap(), resend_msg);
+        prop_assert_eq!(OhmMessage::decode(&resend_msg.encode().unwrap()).unwrap(), resend_msg);
     }
 
     #[test]
@@ -326,7 +434,7 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 5. Stateful ReorderBuffer & ClockSync property invariants
+    // 5. Stateful ReorderBuffer, ClockSync & MemoryRenderer invariants
     // -----------------------------------------------------------------------
 
     #[test]
@@ -336,6 +444,8 @@ proptest! {
         deltas in prop::collection::vec((-40i32..60i32, any::<bool>()), 1..120),
     ) {
         let mut buf = ReorderBuffer::new(max_backlog);
+        let mut last_delivered: Option<u32> = None;
+
         for (delta, resent) in deltas {
             let frame_num = base.wrapping_add_signed(delta);
             let flags = AudioFlags(if resent { AudioFlags::RESENT } else { 0 });
@@ -360,32 +470,133 @@ proptest! {
             match buf.push(pkt) {
                 PushOutcome::Ready(frames) => {
                     prop_assert!(!frames.is_empty());
+                    if let Some(prev) = last_delivered {
+                        prop_assert_eq!(frames[0].frame, prev.wrapping_add(1));
+                    }
                     for w in frames.windows(2) {
                         prop_assert_eq!(w[1].frame, w[0].frame.wrapping_add(1));
                     }
+                    last_delivered = Some(frames.last().unwrap().frame);
                 }
-                PushOutcome::GapDetected | PushOutcome::Duplicate | PushOutcome::Resynced(_) => {}
+                PushOutcome::Resynced(frame) => {
+                    prop_assert!(!buf.has_gaps());
+                    last_delivered = Some(frame.frame);
+                }
+                PushOutcome::GapDetected | PushOutcome::Duplicate => {}
             }
 
             let missing = buf.missing_frames(MAX_RESEND_FRAMES_PER_REQ + 10);
             prop_assert!(missing.len() <= MAX_RESEND_FRAMES_PER_REQ);
+            prop_assert_eq!(buf.has_gaps(), !missing.is_empty());
+            let unique: HashSet<u32> = missing.iter().copied().collect();
+            prop_assert_eq!(unique.len(), missing.len());
         }
     }
 
     #[test]
     fn clock_sync_never_panics_or_produces_nan_across_u32_wrap(
-        rate in prop_oneof![Just(44_100u32), Just(48_000u32), Just(96_000u32), Just(192_000u32)],
+        rate in prop_oneof![Just(0u32), Just(44_100u32), Just(48_000u32), Just(96_000u32), Just(192_000u32)],
         start_ts in prop_oneof![Just(u32::MAX - 500_000), any::<u32>()],
-        steps in prop::collection::vec((0u32..500_000, 0u32..20_000_000, 0u64..20_000), 1..60),
+        steps in prop::collection::vec((-500_000i32..500_000i32, 0u32..20_000_000, 0u64..20_000), 1..60),
     ) {
         let mut clock = ClockSync::new(rate);
         let mut ts = start_ts;
         let mut now = Instant::now();
         for (dt_ticks, latency, dt_us) in steps {
-            ts = ts.wrapping_add(dt_ticks);
+            ts = ts.wrapping_add_signed(dt_ticks);
             now += Duration::from_micros(dt_us);
             let _playout = clock.observe(ts, latency, now);
-            prop_assert!(clock.skew_ppm().is_finite());
+            let skew = clock.skew_ppm();
+            prop_assert!(skew.is_finite());
+            prop_assert!(skew.abs() <= 5_000.0);
+        }
+    }
+
+    #[test]
+    fn memory_renderer_stateful_command_sequence_invariants(
+        ops in prop::collection::vec(renderer_op_strategy(), 1..80),
+    ) {
+        let r = MemoryRenderer::new("FuzzRoom", "FuzzBox");
+        let mut last_token = r.id_array().0;
+
+        for op in ops {
+            let (_tok, ids) = r.id_array();
+            match op {
+                RendererOp::Insert { after_slot, uri } => {
+                    let after_id = if after_slot == 0 || ids.is_empty() {
+                        0
+                    } else {
+                        ids[after_slot % ids.len()]
+                    };
+                    let _ = r.insert(after_id, uri, "<DIDL-Lite/>".to_string());
+                }
+                RendererOp::DeleteSlot(slot) => {
+                    if !ids.is_empty() {
+                        let id = ids[slot % ids.len()];
+                        let _ = r.delete_id(id);
+                    }
+                }
+                RendererOp::DeleteAll => {
+                    let _ = r.delete_all();
+                }
+                RendererOp::Play => {
+                    let _ = r.play();
+                }
+                RendererOp::Pause => {
+                    let _ = r.pause();
+                }
+                RendererOp::Stop => {
+                    let _ = r.stop();
+                }
+                RendererOp::Next => {
+                    let _ = r.next();
+                }
+                RendererOp::Previous => {
+                    let _ = r.previous();
+                }
+                RendererOp::SeekIndex(idx) => {
+                    let _ = r.seek_index(idx);
+                }
+                RendererOp::SetRepeat(v) => {
+                    let _ = r.set_repeat(v);
+                }
+                RendererOp::SetShuffle(v) => {
+                    let _ = r.set_shuffle(v);
+                }
+                RendererOp::SetStandby(v) => {
+                    let _ = r.set_standby(v);
+                }
+                RendererOp::SetSourceIndex(idx) => {
+                    let _ = r.set_source_index(idx);
+                }
+                RendererOp::SetVolume(v) => {
+                    let _ = r.set_volume(v);
+                }
+                RendererOp::SetMute(v) => {
+                    let _ = r.set_mute(v);
+                }
+            }
+
+            // Check core invariants after EVERY operation.
+            let (tok, new_ids) = r.id_array();
+            prop_assert!(tok >= last_token, "IdArray token must be monotonic");
+            last_token = tok;
+
+            let unique: HashSet<u32> = new_ids.iter().copied().collect();
+            prop_assert_eq!(unique.len(), new_ids.len(), "playlist IDs must be unique");
+            prop_assert!(new_ids.len() <= r.tracks_max() as usize);
+
+            let current_id = r.current_id();
+            if current_id != 0 {
+                prop_assert!(
+                    unique.contains(&current_id),
+                    "current_id {current_id} must exist in IdArray"
+                );
+            }
+
+            let vol = r.state().volume;
+            let limit = r.characteristics().volume_max;
+            prop_assert!(vol <= limit, "volume {vol} exceeded max {limit}");
         }
     }
 }
@@ -393,7 +604,6 @@ proptest! {
 // Targeted adversarial XML / binary edge cases (deterministic, zero-flake).
 #[test]
 fn adversarial_xml_and_binary_inputs_fail_cleanly() {
-    // Deeply nested XML (500 levels) must not stack-overflow or panic.
     let deep = format!("{}{}", "<a>".repeat(500), "</a>".repeat(500));
     let _ = decode_soap_args(&deep);
     let _ = decode_device_description(&deep);
@@ -401,7 +611,6 @@ fn adversarial_xml_and_binary_inputs_fail_cleanly() {
     let _ = decode_track_list(&deep);
     let _ = decode_propertyset(&deep);
 
-    // Unclosed CDATA & invalid entity references.
     for nasty in [
         "<s:Envelope><![CDATA[unclosed",
         "<SourceList><Source><Name>&bogus;&#xFFFFFFFF;</Name></Source></SourceList>",
@@ -414,7 +623,6 @@ fn adversarial_xml_and_binary_inputs_fail_cleanly() {
         let _ = decode_ssdp_packet(nasty.as_bytes());
     }
 
-    // Empty property map roundtrip.
     let empty: BTreeMap<String, String> = BTreeMap::new();
     assert_eq!(
         decode_propertyset(&encode_propertyset(&empty)).unwrap(),
