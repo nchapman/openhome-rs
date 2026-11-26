@@ -945,3 +945,46 @@ fn worker_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openhome_audio::NullSink;
+    use openhome_songcast::SenderConfig;
+
+    #[tokio::test]
+    async fn engine_idle_commands_and_sender_helpers_behave_cleanly() {
+        let rt = tokio::runtime::Handle::current();
+        let (engine, _ev_rx) = PlaybackEngine::spawn(Arc::new(NullSink::unpaced()), rt.clone());
+        engine.send(EngineCommand::Play);
+        engine.send(EngineCommand::Pause);
+        engine.send(EngineCommand::Seek(5));
+        engine.send(EngineCommand::DrainAndStop);
+        engine.send(EngineCommand::StopSongcast);
+        engine.send(EngineCommand::SetTrackMetadata {
+            uri: "http://example.invalid/a.flac".into(),
+            metadata: "<DIDL-Lite/>".into(),
+        });
+        engine.send(EngineCommand::StartSongcast {
+            generation: 99,
+            uri: "not-a-songcast-uri".into(),
+            interface: Ipv4Addr::LOCALHOST,
+        });
+        engine.shutdown_async().await;
+
+        let sender = Arc::new(
+            SongcastSender::bind(SenderConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                interface: Ipv4Addr::LOCALHOST,
+                ..SenderConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let mut last_fmt = None;
+        send_songcast_halt(&rt, &Some(Arc::clone(&sender)), &mut last_fmt);
+        send_songcast_halt(&rt, &None, &mut last_fmt);
+        let owned = Arc::try_unwrap(sender).unwrap();
+        owned.shutdown().await;
+    }
+}

@@ -1249,8 +1249,9 @@ async fn sme_regressions_realtime_songcast_gapless_drain_and_state_sync() {
 async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
     use openhome_core::types::SenderStatus;
 
-    let wav = synth_wav(44_100, 44_100 * 2, 0.5); // 2 seconds
-    let (http_addr, http_task) = spawn_wav_http_server(wav.clone(), wav).await;
+    let wav_44k = synth_wav(44_100, 44_100 * 2, 0.5); // 2 seconds @ 44.1 kHz
+    let wav_48k = synth_wav(48_000, 48_000 / 2, 0.4); // 0.5 seconds @ 48 kHz
+    let (http_addr, http_task) = spawn_wav_http_server(wav_44k, wav_48k).await;
     let http_base = format!("http://{http_addr}");
 
     let leader_sink = Arc::new(CaptureSink::realtime());
@@ -1282,6 +1283,8 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
 
     assert!(leader.sender_uri().is_some());
     assert!(follower.sender_uri().is_none());
+    assert!(format!("{leader:?}").contains("OpenHomeEndpoint"));
+    assert!(format!("{:?}", EndpointConfig::default()).contains("EndpointConfig"));
 
     let leader_dev = OpenHomeDevice::connect(leader.description_url())
         .await
@@ -1325,8 +1328,12 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
                       xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
                       <item id=\"1\"><dc:title>Multiroom Jam</dc:title></item></DIDL-Lite>";
     let leader_pl = leader_dev.playlist().unwrap();
-    leader_pl
+    let id1 = leader_pl
         .insert(0, &format!("{http_base}/track1.wav"), track_didl)
+        .await
+        .unwrap();
+    let id2 = leader_pl
+        .insert(id1, &format!("{http_base}/track2.wav"), track_didl)
         .await
         .unwrap();
     leader_pl.play().await.unwrap();
@@ -1370,6 +1377,31 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
     let (_, f_meta) = follower_dev.info().unwrap().track().await.unwrap();
     assert!(f_meta.contains("Multiroom Jam"), "got {f_meta}");
 
+    // Seek on Leader while grouped emits HALT so Follower flushes cleanly and resumes.
+    leader_pl.seek_second_absolute(0).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Skip to the 48 kHz track to exercise mid-stream sample-rate change on both Leader & Follower.
+    leader_pl.seek_id(id2).await.unwrap();
+    let deadline_48k = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline_48k {
+        if follower_sink
+            .frames()
+            .iter()
+            .any(|f| f.spec.sample_rate == 48_000)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        follower_sink
+            .frames()
+            .iter()
+            .any(|f| f.spec.sample_rate == 48_000),
+        "Follower should reopen sink at 48 kHz when Leader switches sample rate"
+    );
+
     // Pausing Leader sends HALT -> Follower returns to Waiting and Sender.Audio becomes false.
     leader_pl.pause().await.unwrap();
     let deadline_halt = Instant::now() + Duration::from_secs(3);
@@ -1387,7 +1419,12 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
     );
     assert!(!sender_client.audio().await.unwrap());
 
-    // Standby disables Leader's Sender.Status.
+    // Stopping Follower and putting Leader in standby disables Leader's Sender.Status.
+    follower_rx.stop().await.unwrap();
+    assert_eq!(
+        follower_rx.transport_state().await.unwrap(),
+        ReceiverState::Stopped
+    );
     leader_dev
         .product()
         .unwrap()
@@ -1398,6 +1435,13 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
         sender_client.status().await.unwrap(),
         SenderStatus::Disabled
     );
+    leader_dev
+        .product()
+        .unwrap()
+        .set_standby(false)
+        .await
+        .unwrap();
+    assert_eq!(sender_client.status().await.unwrap(), SenderStatus::Enabled);
 
     follower.shutdown().await;
     leader.shutdown().await;

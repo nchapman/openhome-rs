@@ -995,5 +995,56 @@ mod tests {
         let _ = std::net::TcpStream::connect(addr);
         let _ = std::net::TcpStream::connect(addr);
         let _ = srv_handle.join();
+
+        // Exercise StreamingHttpSource and HttpRangeStream edge cases directly.
+        let mut live = StreamingHttpSource {
+            reader: Box::new(std::io::Cursor::new(vec![1u8, 2, 3, 4])),
+            byte_len: Some(4),
+        };
+        assert!(!live.is_seekable());
+        assert_eq!(live.byte_len(), Some(4));
+        assert_eq!(
+            live.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        let mut buf = [0u8; 2];
+        assert_eq!(live.read(&mut buf).unwrap(), 2);
+
+        let cancel_gen = Arc::new(AtomicU64::new(1));
+        let mut range = HttpRangeStream {
+            uri: "http://127.0.0.1:1/unused".into(),
+            byte_len: 16,
+            pos: 0,
+            reader: Some(Box::new(std::io::Cursor::new(vec![0u8; 16]))),
+            cancel: Some(LoadCancel::new(1, Arc::clone(&cancel_gen))),
+        };
+        assert!(range.is_seekable());
+        assert_eq!(range.byte_len(), Some(16));
+        assert_eq!(range.seek(SeekFrom::Start(4)).unwrap(), 4);
+        assert_eq!(range.seek(SeekFrom::Current(2)).unwrap(), 6);
+        assert_eq!(range.seek(SeekFrom::End(-4)).unwrap(), 12);
+        assert_eq!(
+            range.seek(SeekFrom::Current(-20)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            range.seek(SeekFrom::End(-20)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        // Reading past byte_len or into empty slice returns 0.
+        assert_eq!(range.seek(SeekFrom::Start(16)).unwrap(), 16);
+        assert_eq!(range.read(&mut buf).unwrap(), 0);
+        assert_eq!(range.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(range.read(&mut []).unwrap(), 0);
+        // Cancelled read / open_range returns ConnectionAborted.
+        cancel_gen.store(2, Ordering::Release);
+        assert_eq!(
+            range.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            range.open_range().unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
     }
 }
