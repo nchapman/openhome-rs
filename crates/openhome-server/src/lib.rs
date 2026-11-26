@@ -16,7 +16,7 @@ pub mod ssdp;
 pub use error::ServerError;
 pub use event::{EventHub, SubscribeError};
 pub use memory::MemoryRenderer;
-pub use server::{OpenHomeServer, OpenHomeServerBuilder};
+pub use server::{OpenHomeServer, OpenHomeServerBuilder, ServerNotifier};
 pub use service::{
     ActionResult, InfoService, PlaylistService, ProductService, ReceiverService, SenderService,
     TimeService, VolumeService,

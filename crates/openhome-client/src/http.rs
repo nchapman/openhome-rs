@@ -229,12 +229,17 @@ impl HttpClient {
     async fn take_pooled(&self, connect_addr: &str) -> Option<SendRequest<Full<Bytes>>> {
         let mut pool = self.pool.lock().await;
         let conns = pool.get_mut(connect_addr)?;
+        let mut chosen = None;
         while let Some(sender) = conns.pop() {
             if sender.is_ready() {
-                return Some(sender);
+                chosen = Some(sender);
+                break;
             }
         }
-        None
+        if conns.is_empty() {
+            pool.remove(connect_addr);
+        }
+        chosen
     }
 
     async fn return_pooled(&self, connect_addr: &str, sender: SendRequest<Full<Bytes>>) {
@@ -280,8 +285,9 @@ impl HttpClient {
             .await
             .map_err(|_| SendOnError::Fatal(ClientError::Http("HTTP request timeout".into())))?
             .map_err(|e| {
-                // Only treat pre-response closed/reset pooled sockets as safely retryable.
-                if e.is_closed() || e.is_canceled() || e.is_incomplete_message() {
+                // Only treat pre-request closed/canceled pooled sockets as safely retryable;
+                // never retry `is_incomplete_message` which can occur after a mutating SOAP ran.
+                if e.is_closed() || e.is_canceled() {
                     SendOnError::StalePool(ClientError::Http(e.to_string()))
                 } else {
                     SendOnError::Fatal(ClientError::Http(e.to_string()))

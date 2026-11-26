@@ -256,13 +256,20 @@ async fn playlist_service_full_roundtrip_and_interop_quirks() {
     playlist.set_shuffle(true).await.unwrap();
     assert!(playlist.shuffle().await.unwrap());
 
-    // Inactive source rule: switch to Receiver -> transport mutations return 409 Conflict,
-    // except Play which auto-selects Playlist.
+    // Inactive source rule: switch to Receiver -> Pause/Next return 409 Conflict,
+    // while SeekId and Play auto-select Playlist (per ohPipeline / upmpdcli).
     product.set_source_by_system_name("Receiver").await.unwrap();
     assert_fault(playlist.pause().await, Fault::CONFLICT);
     assert_fault(playlist.next().await, Fault::CONFLICT);
-    assert_fault(playlist.seek_id(id1).await, Fault::CONFLICT);
 
+    playlist.seek_id(id1).await.unwrap();
+    assert_eq!(product.source_index().await.unwrap(), 0);
+    assert_eq!(
+        playlist.transport_state().await.unwrap(),
+        TransportState::Playing
+    );
+
+    product.set_source_by_system_name("Receiver").await.unwrap();
     playlist.play().await.unwrap();
     assert_eq!(product.source_index().await.unwrap(), 0);
     assert_eq!(

@@ -146,6 +146,8 @@ impl EventListener {
             event_sub_url.clone(),
             sid.clone(),
             granted_timeout,
+            self.routes.clone(),
+            token.clone(),
             renew_stop_rx,
         ));
 
@@ -198,6 +200,15 @@ impl Drop for EventListener {
     }
 }
 
+impl std::fmt::Debug for EventListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventListener")
+            .field("local_addr", &self.local_addr)
+            .field("advertise_host", &self.advertise_host)
+            .finish()
+    }
+}
+
 /// Active GENA event subscription stream.
 pub struct EventSubscription {
     sid: String,
@@ -210,6 +221,16 @@ pub struct EventSubscription {
     renew_stop_tx: watch::Sender<bool>,
     renew_task: Option<JoinHandle<()>>,
     unsubscribed: bool,
+}
+
+impl std::fmt::Debug for EventSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventSubscription")
+            .field("sid", &self.sid)
+            .field("event_sub_url", &self.event_sub_url)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl EventSubscription {
@@ -270,6 +291,8 @@ async fn auto_renew_loop(
     event_sub_url: String,
     sid: String,
     mut timeout_secs: u32,
+    routes: RouteMap,
+    token: String,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut consecutive_failures = 0u8;
@@ -280,8 +303,8 @@ async fn auto_renew_loop(
             u64::from(timeout_secs / 2).max(1)
         };
         tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            res = stop_rx.changed() => {
+                if res.is_err() || *stop_rx.borrow() {
                     break;
                 }
             }
@@ -294,6 +317,11 @@ async fn auto_renew_loop(
                     Err(_) => {
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
+                            // Remove the callback route so `EventSubscription::recv()` returns
+                            // `None` instead of hanging forever after fatal renewal failure.
+                            if let Ok(mut map) = routes.write() {
+                                map.remove(&token);
+                            }
                             break;
                         }
                     }
@@ -311,8 +339,8 @@ async fn serve_callbacks(
     loop {
         let accept = tokio::select! {
             res = listener.accept() => res,
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
                     break;
                 }
                 continue;
@@ -320,6 +348,7 @@ async fn serve_callbacks(
         };
 
         let Ok((stream, _peer)) = accept else {
+            tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         };
         let routes = routes.clone();
@@ -586,6 +615,31 @@ mod tests {
             send_raw_http(addr, mk_full_req()).await,
             StatusCode::PRECONDITION_FAILED
         );
+
+        // Fatal auto_renew_loop exit removes the route so recv() returns None (no hang).
+        let (dead_tx, mut dead_rx) = mpsc::channel(4);
+        listener.routes.write().unwrap().insert(
+            "dead".into(),
+            RouteEntry {
+                tx: dead_tx,
+                expected_sid: Arc::new(RwLock::new(Some("uuid:dead".into()))),
+            },
+        );
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let renew_handle = tokio::spawn(auto_renew_loop(
+            HttpClient::new(Duration::from_millis(100)),
+            "http://127.0.0.1:1/evt/Product".into(),
+            "uuid:dead".into(),
+            1,
+            listener.routes.clone(),
+            "dead".into(),
+            stop_rx,
+        ));
+        let closed = tokio::time::timeout(Duration::from_secs(6), dead_rx.recv())
+            .await
+            .expect("dead subscription closes instead of hanging");
+        assert!(closed.is_none());
+        let _ = renew_handle.await;
 
         listener.shutdown().await;
     }

@@ -176,9 +176,15 @@ pub fn decode_soap_args(xml: &str) -> Result<(String, HashMap<String, String>), 
                     depth_in_action += 1;
                 }
             }
-            Ok(Event::Empty(e)) if in_body && action_name.is_some() && depth_in_action == 0 => {
+            Ok(Event::Empty(e)) if in_body => {
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                args.entry(local).or_default();
+                if action_name.is_none() {
+                    // Zero-arg action/response serialized as self-closing element, e.g. <u:Play/>.
+                    action_name = Some(local);
+                    break;
+                } else if depth_in_action == 0 {
+                    args.entry(local).or_default();
+                }
             }
             Ok(Event::Text(e)) if depth_in_action == 1 => {
                 if let Some(arg) = &current_arg {
@@ -288,5 +294,16 @@ mod tests {
         let f = decode_soap_fault(fault_xml).unwrap().unwrap();
         assert_eq!(f.code, Fault::ACTION_FAILED);
         assert_eq!(f.description, "Custom Fault");
+
+        // Self-closing zero-arg SOAP action & response (ohNet/Kazoo, BubbleUPnP, upmpdcli).
+        let self_closing_req = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Play xmlns:u="urn:av-openhome-org:service:Playlist:1"/></s:Body></s:Envelope>"#;
+        let (act, args) = decode_soap_args(self_closing_req).unwrap();
+        assert_eq!(act, "Play");
+        assert!(args.is_empty());
+
+        let self_closing_resp = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:PlayResponse xmlns:u="urn:av-openhome-org:service:Playlist:1"/></s:Body></s:Envelope>"#;
+        let (resp_act, resp_args) = decode_soap_response(self_closing_resp).unwrap();
+        assert_eq!(resp_act, "PlayResponse");
+        assert!(resp_args.is_empty());
     }
 }

@@ -37,6 +37,7 @@ struct DeliveryState {
     next_seq: u32,
     confirmed_state: BTreeMap<String, String>,
     latest_state: BTreeMap<String, String>,
+    expires_at: Instant,
 }
 
 struct Subscription {
@@ -58,6 +59,15 @@ impl Drop for Subscription {
 #[derive(Clone, Default)]
 pub struct EventHub {
     subs: Arc<RwLock<HashMap<String, Subscription>>>,
+}
+
+impl std::fmt::Debug for EventHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.subs.read().map(|m| m.len()).unwrap_or(0);
+        f.debug_struct("EventHub")
+            .field("subscriptions", &count)
+            .finish()
+    }
 }
 
 impl EventHub {
@@ -93,18 +103,20 @@ impl EventHub {
         let timeout_secs = clamp_timeout(requested_timeout_secs);
         let sid = format!("uuid:{}", Uuid::new_v4());
 
+        let expires_at = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
         let delivery = Arc::new(Mutex::new(DeliveryState {
             initial_sent: false,
             next_seq: 0,
             confirmed_state: BTreeMap::new(),
             latest_state: initial_state,
+            expires_at,
         }));
         let wake = Arc::new(Notify::new());
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         let sub = Subscription {
             service_slug: service_slug.to_string(),
-            expires_at: Instant::now() + Duration::from_secs(u64::from(timeout_secs)),
+            expires_at,
             delivery: delivery.clone(),
             wake: wake.clone(),
             cancel_tx,
@@ -123,12 +135,14 @@ impl EventHub {
         wake.notify_one();
 
         let sid_for_task = sid.clone();
+        let subs_for_task = Arc::clone(&self.subs);
         tokio::spawn(delivery_loop(
             sid_for_task,
             valid_callbacks,
             delivery,
             wake,
             cancel_rx,
+            subs_for_task,
         ));
 
         Ok((sid, timeout_secs))
@@ -149,7 +163,12 @@ impl EventHub {
         if sub.service_slug != service_slug {
             return None;
         }
-        sub.expires_at = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+        let new_expiry = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+        sub.expires_at = new_expiry;
+        if let Ok(mut st) = sub.delivery.lock() {
+            st.expires_at = new_expiry;
+        }
+        sub.wake.notify_one();
         Some(timeout_secs)
     }
 
@@ -257,6 +276,7 @@ async fn delivery_loop(
     delivery: Arc<Mutex<DeliveryState>>,
     wake: Arc<Notify>,
     mut cancel: watch::Receiver<bool>,
+    subs: Arc<RwLock<HashMap<String, Subscription>>>,
 ) {
     // Yield once so the SUBSCRIBE HTTP response can be flushed before SEQ=0.
     tokio::task::yield_now().await;
@@ -270,9 +290,9 @@ async fn delivery_loop(
         }
 
         // Build the next outbound payload by diffing latest_state vs confirmed_state.
-        let pending = {
+        let (expires_at, pending) = {
             let state = delivery.lock().expect("DeliveryState lock poisoned");
-            if !state.initial_sent {
+            let pending = if !state.initial_sent {
                 Some((0u32, state.latest_state.clone()))
             } else {
                 let mut delta = BTreeMap::new();
@@ -286,56 +306,96 @@ async fn delivery_loop(
                 } else {
                     Some((state.next_seq, delta))
                 }
-            }
+            };
+            (state.expires_at, pending)
         };
+
+        let now = Instant::now();
+        if now >= expires_at {
+            break;
+        }
+        let until_expiry = expires_at.saturating_duration_since(now);
 
         let Some((seq, sent_props)) = pending else {
             tokio::select! {
                 _ = wake.notified() => continue,
-                _ = cancel.changed() => break,
+                _ = tokio::time::sleep(until_expiry) => continue,
+                res = cancel.changed() => {
+                    if res.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
             }
+            continue;
         };
 
         let body = Bytes::from(encode_propertyset(&sent_props));
-        let mut delivered = false;
+        let mut outcome = NotifyOutcome::TransientError;
         for url in &callbacks {
-            if send_notify(url, &sid, seq, body.clone(), &mut cached_conn)
-                .await
-                .is_ok()
-            {
-                delivered = true;
-                break;
+            match send_notify(url, &sid, seq, body.clone(), &mut cached_conn).await {
+                NotifyOutcome::Delivered => {
+                    outcome = NotifyOutcome::Delivered;
+                    break;
+                }
+                NotifyOutcome::PermanentReject => {
+                    outcome = NotifyOutcome::PermanentReject;
+                }
+                NotifyOutcome::TransientError => {}
             }
         }
 
-        if delivered {
-            consecutive_failures = 0;
-            let mut state = delivery.lock().expect("DeliveryState lock poisoned");
-            if !state.initial_sent {
-                state.initial_sent = true;
-                state.next_seq = 1;
-                state.confirmed_state = sent_props;
-            } else {
-                // Per UPnP GENA 1.1: sequence wraps from u32::MAX back to 1 (never 0).
-                state.next_seq = if seq == u32::MAX { 1 } else { seq + 1 };
-                for (k, v) in sent_props {
-                    state.confirmed_state.insert(k, v);
+        match outcome {
+            NotifyOutcome::Delivered => {
+                consecutive_failures = 0;
+                let mut state = delivery.lock().expect("DeliveryState lock poisoned");
+                if !state.initial_sent {
+                    state.initial_sent = true;
+                    state.next_seq = 1;
+                    state.confirmed_state = sent_props;
+                } else {
+                    // Per UPnP GENA 1.1: sequence wraps from u32::MAX back to 1 (never 0).
+                    state.next_seq = if seq == u32::MAX { 1 } else { seq + 1 };
+                    for (k, v) in sent_props {
+                        state.confirmed_state.insert(k, v);
+                    }
                 }
             }
-        } else {
-            // Transient delivery failure: confirmed_state is NOT advanced so the
-            // unconfirmed delta is preserved for retry with capped exponential backoff.
-            let backoff_ms = 250u64
-                .saturating_mul(1u64 << consecutive_failures.min(4))
-                .min(4_000);
-            consecutive_failures = consecutive_failures.saturating_add(1);
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                _ = wake.notified() => {}
-                _ = cancel.changed() => break,
+            NotifyOutcome::PermanentReject => {
+                // Subscriber explicitly rejected SID (412/404/410): stop notifying immediately.
+                break;
+            }
+            NotifyOutcome::TransientError => {
+                // Transient delivery failure: confirmed_state is NOT advanced so the
+                // unconfirmed delta is preserved for retry with capped exponential backoff.
+                let backoff_ms = 250u64
+                    .saturating_mul(1u64 << consecutive_failures.min(4))
+                    .min(4_000);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let sleep_dur = Duration::from_millis(backoff_ms).min(until_expiry);
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_dur) => {}
+                    _ = wake.notified() => {}
+                    res = cancel.changed() => {
+                        if res.is_err() || *cancel.borrow() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
+
+    // Self-cleanup on expiry or permanent callback rejection.
+    if let Ok(mut map) = subs.write() {
+        map.remove(&sid);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyOutcome {
+    Delivered,
+    PermanentReject,
+    TransientError,
 }
 
 async fn send_notify(
@@ -344,43 +404,54 @@ async fn send_notify(
     seq: u32,
     body_bytes: Bytes,
     cached_conn: &mut Option<(String, hyper::client::conn::http1::SendRequest<Full<Bytes>>)>,
-) -> Result<(), ()> {
-    let (host_port, path) = parse_http_url(url).ok_or(())?;
+) -> NotifyOutcome {
+    let Some((host_port, path)) = parse_http_url(url) else {
+        return NotifyOutcome::PermanentReject;
+    };
 
     // Try reusing an existing keep-alive connection for the same host:port first.
     if let Some((cached_host, mut sender)) = cached_conn.take()
         && cached_host == host_port
         && sender.is_ready()
-        && let Ok(keep_alive) =
-            send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes.clone()).await
     {
-        if keep_alive && sender.is_ready() {
-            *cached_conn = Some((cached_host, sender));
+        match send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes.clone()).await {
+            Ok((NotifyOutcome::Delivered, keep_alive)) => {
+                if keep_alive && sender.is_ready() {
+                    *cached_conn = Some((cached_host, sender));
+                }
+                return NotifyOutcome::Delivered;
+            }
+            Ok((NotifyOutcome::PermanentReject, _)) => return NotifyOutcome::PermanentReject,
+            _ => {}
         }
-        return Ok(());
     }
 
-    let stream = tokio::time::timeout(NOTIFY_TIMEOUT, TcpStream::connect(&host_port))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+    let Ok(Ok(stream)) = tokio::time::timeout(NOTIFY_TIMEOUT, TcpStream::connect(&host_port)).await
+    else {
+        return NotifyOutcome::TransientError;
+    };
 
     let io = TokioIo::new(stream);
-    let (mut sender, conn) =
-        tokio::time::timeout(NOTIFY_TIMEOUT, hyper::client::conn::http1::handshake(io))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+    let Ok(Ok((mut sender, conn))) =
+        tokio::time::timeout(NOTIFY_TIMEOUT, hyper::client::conn::http1::handshake(io)).await
+    else {
+        return NotifyOutcome::TransientError;
+    };
 
     tokio::spawn(async move {
         let _ = conn.await;
     });
 
-    let keep_alive = send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes).await?;
-    if keep_alive && sender.is_ready() {
-        *cached_conn = Some((host_port, sender));
+    match send_notify_on(&mut sender, &host_port, &path, sid, seq, body_bytes).await {
+        Ok((NotifyOutcome::Delivered, keep_alive)) => {
+            if keep_alive && sender.is_ready() {
+                *cached_conn = Some((host_port, sender));
+            }
+            NotifyOutcome::Delivered
+        }
+        Ok((other, _)) => other,
+        Err(()) => NotifyOutcome::TransientError,
     }
-    Ok(())
 }
 
 async fn send_notify_on(
@@ -390,7 +461,7 @@ async fn send_notify_on(
     sid: &str,
     seq: u32,
     body_bytes: Bytes,
-) -> Result<bool, ()> {
+) -> Result<(NotifyOutcome, bool), ()> {
     let req = Request::builder()
         .method("NOTIFY")
         .uri(path)
@@ -419,9 +490,16 @@ async fn send_notify_on(
     let _ = tokio::time::timeout(NOTIFY_TIMEOUT, limited.collect()).await;
 
     if status.is_success() {
-        Ok(!conn_close)
+        Ok((NotifyOutcome::Delivered, !conn_close))
+    } else if matches!(
+        status,
+        hyper::StatusCode::PRECONDITION_FAILED
+            | hyper::StatusCode::NOT_FOUND
+            | hyper::StatusCode::GONE
+    ) {
+        Ok((NotifyOutcome::PermanentReject, false))
     } else {
-        Err(())
+        Ok((NotifyOutcome::TransientError, false))
     }
 }
 
@@ -618,5 +696,50 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, SubscribeError::TooManySubscriptions);
         hub.clear();
+    }
+
+    #[tokio::test]
+    async fn event_hub_cancels_subscription_immediately_on_412() {
+        use hyper::Response;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(hyper::StatusCode::PRECONDITION_FAILED)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            }
+        });
+
+        let hub = EventHub::new();
+        let mut init = BTreeMap::new();
+        init.insert("Volume".into(), "10".into());
+        hub.subscribe(
+            "Volume",
+            vec![format!("http://{cb_addr}/cb")],
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some(300),
+            init,
+        )
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while hub.active_subscription_count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(hub.active_subscription_count(), 0);
+        srv.abort();
     }
 }

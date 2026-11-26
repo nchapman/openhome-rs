@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use openhome_core::DeviceDescription;
 use openhome_core::ssdp::{SSDP_ADDR_V4, SsdpMessage, decode_ssdp_packet, encode_msearch};
-use openhome_core::urn::DEVICE_SOURCE_1;
+use openhome_core::urn::UPNP_ROOT_DEVICE;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -46,7 +46,10 @@ pub struct DiscoveryOptions {
 impl Default for DiscoveryOptions {
     fn default() -> Self {
         Self {
-            st: DEVICE_SOURCE_1.to_string(),
+            // Query upnp:rootdevice so we discover all OpenHome renderers regardless of
+            // deviceType (av-openhome-org:device:Source:1, Product:1, or MediaRenderer:1),
+            // then filter via `openhome_only` using Product service presence.
+            st: UPNP_ROOT_DEVICE.to_string(),
             mx_secs: 2,
             timeout: Duration::from_secs(3),
             target_addr: SSDP_ADDR_V4,
@@ -101,7 +104,7 @@ pub async fn discover(options: DiscoveryOptions) -> Result<Vec<DiscoveredDevice>
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = socket.send_to(packet.as_bytes(), dest).await;
+        socket.send_to(packet.as_bytes(), dest).await?;
     }
 
     let deadline = Instant::now() + options.timeout;

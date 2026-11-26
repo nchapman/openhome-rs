@@ -60,35 +60,48 @@ pub struct Topology {
 
 impl Topology {
     /// Query `Product:1` metadata on every device in `devices` concurrently and group them by room.
+    /// Returns an error if any device fails; use [`Self::from_devices_lossy`] to tolerate offline rooms.
     pub async fn from_devices(devices: &[OpenHomeDevice]) -> Result<Self, ClientError> {
+        let (topo, errors) = Self::from_devices_lossy(devices).await;
+        if let Some((_, err)) = errors.into_iter().next() {
+            return Err(err);
+        }
+        Ok(topo)
+    }
+
+    /// Query `Product:1` metadata on every device concurrently, returning the partial
+    /// [`Topology`] for healthy rooms alongside `(udn, error)` pairs for any unreachable devices.
+    pub async fn from_devices_lossy(
+        devices: &[OpenHomeDevice],
+    ) -> (Self, Vec<(String, ClientError)>) {
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DEVICES));
         let mut set = JoinSet::new();
 
         for (idx, dev) in devices.iter().cloned().enumerate() {
             let sem = sem.clone();
             set.spawn(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ClientError::Http("topology semaphore closed".into()))?;
-                let product = dev.product()?;
-                let (details, standby, sources, source_index, attributes) = tokio::try_join!(
-                    product.product(),
-                    product.standby(),
-                    product.source_xml(),
-                    product.source_index(),
-                    product.attributes(),
-                )?;
+                let udn = dev.udn().to_string();
+                let res: Result<TopologyDevice, ClientError> = async {
+                    let _permit = sem
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ClientError::Http("topology semaphore closed".into()))?;
+                    let product = dev.product()?;
+                    let (details, standby, sources, source_index, attributes) = tokio::try_join!(
+                        product.product(),
+                        product.standby(),
+                        product.source_xml(),
+                        product.source_index(),
+                        product.attributes(),
+                    )?;
 
-                let room_name = if details.room.is_empty() {
-                    dev.friendly_name().to_string()
-                } else {
-                    details.room.clone()
-                };
+                    let room_name = if details.room.is_empty() {
+                        dev.friendly_name().to_string()
+                    } else {
+                        details.room.clone()
+                    };
 
-                Ok::<_, ClientError>((
-                    idx,
-                    TopologyDevice {
+                    Ok(TopologyDevice {
                         udn: dev.udn().to_string(),
                         location: dev.location().to_string(),
                         friendly_name: dev.friendly_name().to_string(),
@@ -98,15 +111,21 @@ impl Topology {
                         sources,
                         source_index,
                         attributes,
-                    },
-                ))
+                    })
+                }
+                .await;
+                (idx, udn, res)
             });
         }
 
         let mut entries = Vec::with_capacity(devices.len());
-        while let Some(res) = set.join_next().await {
-            let item = res.map_err(|e| ClientError::Http(e.to_string()))??;
-            entries.push(item);
+        let mut errors = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((idx, _udn, Ok(entry))) => entries.push((idx, entry)),
+                Ok((_idx, udn, Err(err))) => errors.push((udn, err)),
+                Err(err) => errors.push((String::new(), ClientError::Http(err.to_string()))),
+            }
         }
         // Preserve caller-provided ordering within each room.
         entries.sort_by_key(|(idx, _)| *idx);
@@ -124,7 +143,7 @@ impl Topology {
                 .push(entry);
         }
 
-        Ok(Self { rooms })
+        (Self { rooms }, errors)
     }
 
     pub fn rooms(&self) -> impl Iterator<Item = &RoomTopology> {

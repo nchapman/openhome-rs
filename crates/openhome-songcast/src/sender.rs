@@ -65,6 +65,9 @@ pub struct SenderConfig {
     /// Local UDP bind address (pass `127.0.0.1:0` for ephemeral unicast, or a multicast
     /// endpoint like `sender_channel_addr(channel)` for OHM multicast).
     pub bind_addr: SocketAddrV4,
+    /// Optional IPv4 address advertised by [`SongcastSender::uri`] in unicast mode
+    /// (useful when `bind_addr` is `0.0.0.0:0`).
+    pub advertise_ip: Option<Ipv4Addr>,
     /// Outbound multicast interface IPv4 (used when `bind_addr.ip()` is multicast).
     pub interface: Ipv4Addr,
     /// Multicast TTL (default `1`, matching `ohPipeline` `OhmSender::kTtl`).
@@ -81,6 +84,7 @@ impl Default for SenderConfig {
     fn default() -> Self {
         Self {
             bind_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            advertise_ip: None,
             interface: Ipv4Addr::UNSPECIFIED,
             ttl: 1,
             latency_ms: DEFAULT_LATENCY_MS,
@@ -158,10 +162,27 @@ impl SenderState {
 pub struct SongcastSender {
     socket: Arc<UdpSocket>,
     local_addr: SocketAddrV4,
+    advertise_ip: Option<Ipv4Addr>,
     multicast_dest: Option<SocketAddrV4>,
     state: Arc<Mutex<SenderState>>,
     shutdown_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for SongcastSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SongcastSender")
+            .field("local_addr", &self.local_addr)
+            .field("multicast_dest", &self.multicast_dest)
+            .field("active_receivers", &self.active_receivers())
+            .finish()
+    }
+}
+
+impl Drop for SongcastSender {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 impl SongcastSender {
@@ -211,8 +232,8 @@ impl SongcastSender {
             let mut buf = [0u8; 4096];
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -234,10 +255,11 @@ impl SongcastSender {
         Ok(Self {
             socket,
             local_addr,
+            advertise_ip: config.advertise_ip,
             multicast_dest,
             state,
             shutdown_tx,
-            task,
+            task: Some(task),
         })
     }
 
@@ -250,7 +272,10 @@ impl SongcastSender {
     pub fn uri(&self) -> SongcastUri {
         match self.multicast_dest {
             Some(mc) => SongcastUri::Multicast(mc),
-            None => SongcastUri::Unicast(self.local_addr),
+            None => {
+                let ip = self.advertise_ip.unwrap_or(*self.local_addr.ip());
+                SongcastUri::Unicast(SocketAddrV4::new(ip, self.local_addr.port()))
+            }
         }
     }
 
@@ -396,9 +421,11 @@ impl SongcastSender {
     }
 
     /// Shut down the sender background control loop cleanly.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
@@ -459,12 +486,46 @@ async fn handle_incoming_control(
             }
         }
         OhmMessage::Listen => {
-            let mut st = state.lock().unwrap();
-            st.prune_expired(now);
-            if st.receivers.contains_key(&peer) || st.receivers.len() < MAX_SLAVES + 1 {
-                st.receivers.insert(peer, now);
-                if st.primary.is_none() {
-                    st.primary = Some(peer);
+            let update = {
+                let mut st = state.lock().unwrap();
+                let before_primary = st.primary;
+                let before_len = st.receivers.len();
+                st.prune_expired(now);
+                let was_present = st.receivers.contains_key(&peer);
+                if was_present || st.receivers.len() < MAX_SLAVES + 1 {
+                    st.receivers.insert(peer, now);
+                    if st.primary.is_none() {
+                        st.primary = Some(peer);
+                    }
+                }
+                let topology_changed = !was_present
+                    || st.primary != before_primary
+                    || st.receivers.len() != before_len;
+                if multicast_dest.is_none() && topology_changed {
+                    st.primary.map(|p| {
+                        (
+                            p,
+                            st.slaves(),
+                            !was_present,
+                            st.track.clone(),
+                            st.metatext.clone(),
+                        )
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some((primary, slaves, rejoined, track, metatext)) = update {
+                if let Ok(sb) = OhmMessage::Slave(slaves).encode() {
+                    let _ = socket.send_to(&sb, SocketAddr::V4(primary)).await;
+                }
+                if rejoined {
+                    if let Ok(tb) = OhmMessage::Track(track).encode() {
+                        let _ = socket.send_to(&tb, SocketAddr::V4(primary)).await;
+                    }
+                    if let Ok(mb) = OhmMessage::Metatext(metatext).encode() {
+                        let _ = socket.send_to(&mb, SocketAddr::V4(primary)).await;
+                    }
                 }
             }
         }

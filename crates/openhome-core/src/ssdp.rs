@@ -105,9 +105,11 @@ pub fn encode_search_response(
     server: &str,
     max_age_secs: u32,
 ) -> String {
+    let date = rfc1123_utc_now();
     format!(
         "HTTP/1.1 200 OK\r\n\
          CACHE-CONTROL: max-age={max_age_secs}\r\n\
+         DATE: {date}\r\n\
          EXT:\r\n\
          LOCATION: {location}\r\n\
          SERVER: {server}\r\n\
@@ -115,6 +117,43 @@ pub fn encode_search_response(
          USN: {usn}\r\n\
          \r\n"
     )
+}
+
+/// Format the current UTC wall-clock time as an HTTP/1.1 RFC 1123 date string.
+fn rfc1123_utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_rfc1123_utc(secs)
+}
+
+fn format_rfc1123_utc(unix_secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days_since_epoch = (unix_secs / 86_400) as i64;
+    let rem = unix_secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    let dow = DAYS[(days_since_epoch.rem_euclid(7)) as usize];
+
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    let mon = MONTHS[(month - 1) as usize];
+
+    format!("{dow}, {day:02} {mon} {year:04} {hour:02}:{min:02}:{sec:02} GMT")
 }
 
 /// Format the SSDP USN for a given UDN and target (`nt`/`st`).
@@ -338,6 +377,20 @@ mod tests {
                 max_age: Some(90),
             })
         );
+
+        assert_eq!(format_rfc1123_utc(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            format_rfc1123_utc(1_700_000_000),
+            "Tue, 14 Nov 2023 22:13:20 GMT"
+        );
+        let resp = encode_search_response(
+            "http://10.0.0.5:8080/desc.xml",
+            DEVICE_SOURCE_1,
+            "uuid:999::urn:av-openhome-org:device:Source:1",
+            "Test/1.0",
+            1800,
+        );
+        assert!(resp.contains("DATE: ") && resp.contains(" GMT\r\n"));
 
         assert!(decode_ssdp_packet(b"").is_err());
         assert!(decode_ssdp_packet(&[0xff, 0xfe]).is_err());

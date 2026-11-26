@@ -234,6 +234,66 @@ impl OpenHomeServerBuilder {
     }
 }
 
+/// Cloneable handle for pushing out-of-band GENA notifications from audio backends
+/// without holding a reference to [`OpenHomeServer`].
+#[derive(Clone)]
+pub struct ServerNotifier {
+    registry: ServiceRegistry,
+    events: EventHub,
+}
+
+impl std::fmt::Debug for ServerNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerNotifier")
+            .field("events", &self.events)
+            .finish()
+    }
+}
+
+impl ServerNotifier {
+    /// Push updated GENA state for a single service slug (if any subscriber is active).
+    pub fn notify_service(&self, slug: &str) {
+        if !self.events.has_subscribers_for(slug) {
+            return;
+        }
+        if let Some(snapshot) = self.registry.state_snapshot(slug) {
+            self.events.notify_snapshot(slug, &snapshot);
+        }
+    }
+
+    pub fn notify_product(&self) {
+        self.notify_service(SLUG_PRODUCT);
+    }
+
+    pub fn notify_playlist(&self) {
+        self.notify_service(SLUG_PLAYLIST);
+    }
+
+    pub fn notify_info(&self) {
+        self.notify_service(SLUG_INFO);
+    }
+
+    pub fn notify_time(&self) {
+        self.notify_service(SLUG_TIME);
+    }
+
+    pub fn notify_volume(&self) {
+        self.notify_service(SLUG_VOLUME);
+    }
+
+    pub fn notify_receiver(&self) {
+        self.notify_service(SLUG_RECEIVER);
+    }
+
+    pub fn notify_sender(&self) {
+        self.notify_service(SLUG_SENDER);
+    }
+
+    pub fn notify_all(&self) {
+        notify_all_services(&self.registry, &self.events);
+    }
+}
+
 /// Running OpenHome Media server handle.
 pub struct OpenHomeServer {
     udn: String,
@@ -245,6 +305,27 @@ pub struct OpenHomeServer {
     shutdown_tx: watch::Sender<bool>,
     http_task: Option<JoinHandle<()>>,
     ssdp_task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for OpenHomeServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenHomeServer")
+            .field("udn", &self.udn)
+            .field("local_addr", &self.local_addr)
+            .field("description_url", &self.description_url)
+            .field("events", &self.events)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OpenHomeServerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenHomeServerBuilder")
+            .field("udn", &self.udn)
+            .field("friendly_name", &self.friendly_name)
+            .field("bind_addr", &self.bind_addr)
+            .finish()
+    }
 }
 
 impl OpenHomeServer {
@@ -270,6 +351,15 @@ impl OpenHomeServer {
 
     pub fn events(&self) -> &EventHub {
         &self.events
+    }
+
+    /// Return a lightweight, cloneable [`ServerNotifier`] handle for pushing
+    /// out-of-band GENA notifications from background audio tasks.
+    pub fn notifier(&self) -> ServerNotifier {
+        ServerNotifier {
+            registry: self.registry.clone(),
+            events: self.events.clone(),
+        }
     }
 
     /// Push any changed state variables for a specific service slug to GENA subscribers.
@@ -413,7 +503,19 @@ mod tests {
         assert!(server.ssdp_addr().is_none());
         assert!(server.description_url().starts_with("http://127.0.0.1:"));
 
-        // All notify_* helpers succeed cleanly with zero subscribers.
+        // All notify_* helpers succeed cleanly with zero subscribers (on server & ServerNotifier).
+        assert!(format!("{server:?}").contains("OpenHomeServer"));
+        let notifier = server.notifier();
+        assert!(format!("{notifier:?}").contains("ServerNotifier"));
+        notifier.notify_product();
+        notifier.notify_playlist();
+        notifier.notify_info();
+        notifier.notify_time();
+        notifier.notify_volume();
+        notifier.notify_receiver();
+        notifier.notify_sender();
+        notifier.notify_all();
+
         server.notify_product();
         server.notify_playlist();
         server.notify_info();

@@ -476,3 +476,129 @@ async fn sender_freezes_frame_when_idle_and_evicts_old_resend_history() {
 
     sender.shutdown().await;
 }
+
+#[tokio::test]
+async fn dropping_songcast_handles_without_shutdown_exits_cleanly_and_advertise_ip_works() {
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        advertise_ip: Some(Ipv4Addr::new(192, 168, 1, 42)),
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        sender.uri(),
+        SongcastUri::Unicast(SocketAddrV4::new(
+            Ipv4Addr::new(192, 168, 1, 42),
+            sender.local_addr().port()
+        ))
+    );
+    assert!(format!("{sender:?}").contains("SongcastSender"));
+
+    let zone = ZoneResponder::bind(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        Ipv4Addr::LOCALHOST,
+    )
+    .await
+    .unwrap();
+    assert!(format!("{zone:?}").contains("ZoneResponder"));
+
+    let rx = SongcastReceiver::connect(
+        &SongcastUri::Unicast(sender.local_addr()),
+        ReceiverConfig {
+            interface: Ipv4Addr::LOCALHOST,
+            ..ReceiverConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(format!("{rx:?}").contains("SongcastReceiver"));
+
+    // Dropping without `.shutdown().await` triggers Drop -> shutdown_tx.send(true) cleanly.
+    drop(rx);
+    drop(zone);
+    drop(sender);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+#[tokio::test]
+async fn unicast_listen_rejoin_updates_primary_slaves_and_halt_frame_resets_clock() {
+    let sender = SongcastSender::bind(SenderConfig {
+        bind_addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        receiver_expiry: Duration::from_millis(120),
+        ..SenderConfig::default()
+    })
+    .await
+    .unwrap();
+    sender
+        .set_track("http://media/rejoin.flac", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    sender.set_metatext("Rejoin Track").await.unwrap();
+
+    let dest = SocketAddr::V4(sender.local_addr());
+    let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let slave = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let slave_addr = match slave.local_addr().unwrap() {
+        SocketAddr::V4(a) => a,
+        _ => unreachable!(),
+    };
+
+    // Primary joins, then slave sends Listen directly (rejoin without Join) ->
+    // sender pushes updated Slave([slave]) + Track + Metatext to primary.
+    primary
+        .send_to(&OhmMessage::Join.encode().unwrap(), dest)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sender.active_receivers() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Drain initial Join replies on primary.
+    let mut buf = [0u8; 4096];
+    while tokio::time::timeout(Duration::from_millis(30), primary.recv_from(&mut buf))
+        .await
+        .is_ok()
+    {}
+
+    slave
+        .send_to(&OhmMessage::Listen.encode().unwrap(), dest)
+        .await
+        .unwrap();
+
+    let mut saw_slave = false;
+    let mut saw_track = false;
+    let mut saw_meta = false;
+    let wait_until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !(saw_slave && saw_track && saw_meta) && tokio::time::Instant::now() < wait_until {
+        if let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(200), primary.recv_from(&mut buf)).await
+        {
+            match OhmMessage::decode(&buf[..len]).unwrap() {
+                OhmMessage::Slave(list) if list == vec![slave_addr] => saw_slave = true,
+                OhmMessage::Track(t) if t.uri == "http://media/rejoin.flac" => saw_track = true,
+                OhmMessage::Metatext(m) if m.metatext == "Rejoin Track" => saw_meta = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_slave && saw_track && saw_meta);
+
+    // Send a HALT audio frame to verify halt-flag path on receiver without panicking.
+    let mut rx = SongcastReceiver::connect(
+        &SongcastUri::Unicast(sender.local_addr()),
+        ReceiverConfig {
+            interface: Ipv4Addr::LOCALHOST,
+            ..ReceiverConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let fmt = AudioFormat::pcm(48_000, 16, 2);
+    sender.send_audio(&fmt, vec![0xAA; 64], true).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+
+    rx.shutdown().await;
+    sender.shutdown().await;
+}

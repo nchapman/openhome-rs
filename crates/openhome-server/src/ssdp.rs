@@ -139,8 +139,8 @@ impl SsdpRunner {
         let mut buf = [0u8; 4096];
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }

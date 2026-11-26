@@ -108,6 +108,11 @@ impl Inner {
             }
             self.source_index = idx;
             self.standby = false;
+            // Clear stale Info metadata when switching away from the previous source.
+            self.current_uri.clear();
+            self.current_metadata.clear();
+            self.metatext.clear();
+            self.time.seconds = 0;
         }
     }
 
@@ -141,6 +146,22 @@ impl Inner {
 #[derive(Clone)]
 pub struct MemoryRenderer {
     inner: Arc<RwLock<Inner>>,
+}
+
+impl std::fmt::Debug for MemoryRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.read().ok();
+        f.debug_struct("MemoryRenderer")
+            .field(
+                "room",
+                &inner.as_ref().map(|s| s.product_info.product_room.as_str()),
+            )
+            .field(
+                "name",
+                &inner.as_ref().map(|s| s.product_info.product_name.as_str()),
+            )
+            .finish()
+    }
 }
 
 impl MemoryRenderer {
@@ -485,7 +506,11 @@ impl PlaylistService for MemoryRenderer {
 
     fn seek_id(&self, id: u32) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
-        inner.require_playlist_active()?;
+        // Per ohPipeline SourcePlaylist & upmpdcli: SeekId auto-selects Playlist.
+        if !inner.is_source_type_active(&SourceType::Playlist) {
+            inner.select_source_type(&SourceType::Playlist);
+        }
+        inner.standby = false;
         let pos = inner
             .tracks
             .iter()
@@ -498,7 +523,11 @@ impl PlaylistService for MemoryRenderer {
 
     fn seek_index(&self, index: u32) -> ActionResult<()> {
         let mut inner = self.inner.write().unwrap();
-        inner.require_playlist_active()?;
+        // Per ohPipeline SourcePlaylist & upmpdcli: SeekIndex auto-selects Playlist.
+        if !inner.is_source_type_active(&SourceType::Playlist) {
+            inner.select_source_type(&SourceType::Playlist);
+        }
+        inner.standby = false;
         let pos = index as usize;
         if pos >= inner.tracks.len() {
             return Err(Fault::invalid_index());
@@ -761,6 +790,9 @@ impl ReceiverService for MemoryRenderer {
                 "Metadata exceeds maximum allowed length",
             ));
         }
+        if !uri.is_empty() && !uri.contains("://") {
+            return Err(Fault::new(800, "Invalid Receiver Sender URI"));
+        }
         let mut inner = self.inner.write().unwrap();
         inner.receiver_uri = uri;
         inner.receiver_metadata = metadata;
@@ -909,6 +941,35 @@ mod tests {
         assert_eq!(
             r.set_sender(huge, String::new()).unwrap_err().code,
             Fault::INVALID_ARGS
+        );
+        // Invalid Receiver Sender URI (missing scheme) -> Fault 800; empty clears.
+        assert_eq!(
+            r.set_sender("not-a-uri".into(), String::new())
+                .unwrap_err()
+                .code,
+            800
+        );
+        r.set_sender(String::new(), String::new()).unwrap();
+
+        // SeekId / SeekIndex auto-select Playlist even from Receiver / Standby;
+        // switching source clears stale Info metadata.
+        let id = r
+            .insert(0, "http://t/1.flac".into(), "<DIDL/>".into())
+            .unwrap();
+        r.set_source_by_system_name("Receiver").unwrap();
+        r.seek_id(id).unwrap();
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Playing
+        );
+        assert_eq!(r.track().0, "http://t/1.flac");
+
+        r.set_source_by_system_name("Receiver").unwrap();
+        assert_eq!(r.track().0, "");
+        r.seek_index(0).unwrap();
+        assert_eq!(
+            PlaylistService::transport_state(&r),
+            TransportState::Playing
         );
     }
 }

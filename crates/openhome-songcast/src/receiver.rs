@@ -18,7 +18,9 @@ use crate::reorder::{
     DEFAULT_MAX_BACKLOG_FRAMES, MAX_RESEND_FRAMES_PER_REQ, PushOutcome, ReorderBuffer,
 };
 use crate::uri::SongcastUri;
-use crate::zone::{bind_udp_v4, resolve_zone};
+use crate::zone::{bind_udp_v4, resolve_zone_on};
+
+const RECEIVER_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Default `Join` retry interval (`ohSongcast`: `kTimerJoinTimeoutMs = 300ms`).
 pub const DEFAULT_JOIN_INTERVAL: Duration = Duration::from_millis(300);
@@ -82,9 +84,23 @@ pub enum ReceiverEvent {
 /// Async Songcast receiver.
 pub struct SongcastReceiver {
     resolved_uri: SongcastUri,
-    events_rx: mpsc::UnboundedReceiver<ReceiverEvent>,
+    events_rx: mpsc::Receiver<ReceiverEvent>,
     shutdown_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for SongcastReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SongcastReceiver")
+            .field("resolved_uri", &self.resolved_uri)
+            .finish()
+    }
+}
+
+impl Drop for SongcastReceiver {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 impl SongcastReceiver {
@@ -94,7 +110,13 @@ impl SongcastReceiver {
     pub async fn connect(uri: &SongcastUri, config: ReceiverConfig) -> Result<Self, SongcastError> {
         let resolved_uri = match uri {
             SongcastUri::Zone { endpoint, zone } => {
-                resolve_zone(*endpoint, zone, config.zone_resolve_timeout).await?
+                resolve_zone_on(
+                    *endpoint,
+                    zone,
+                    config.interface,
+                    config.zone_resolve_timeout,
+                )
+                .await?
             }
             other => other.clone(),
         };
@@ -108,7 +130,7 @@ impl SongcastReceiver {
         };
 
         let socket = bind_udp_v4(bind_addr, config.interface, config.ttl)?;
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(RECEIVER_EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(async move {
@@ -141,8 +163,8 @@ impl SongcastReceiver {
             loop {
                 let fully_joined = joined_track && joined_metatext;
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -178,7 +200,7 @@ impl SongcastReceiver {
                                 joined_track = true;
                                 if last_track_seq != Some(track.sequence) {
                                     last_track_seq = Some(track.sequence);
-                                    let _ = events_tx.send(ReceiverEvent::Track(track));
+                                    let _ = events_tx.try_send(ReceiverEvent::Track(track));
                                 }
                             }
                             OhmMessage::Metatext(mt) => {
@@ -190,7 +212,7 @@ impl SongcastReceiver {
                                 joined_metatext = true;
                                 if last_meta_seq != Some(mt.sequence) {
                                     last_meta_seq = Some(mt.sequence);
-                                    let _ = events_tx.send(ReceiverEvent::Metatext(mt));
+                                    let _ = events_tx.try_send(ReceiverEvent::Metatext(mt));
                                 }
                             }
                             OhmMessage::Audio(audio) => {
@@ -201,10 +223,12 @@ impl SongcastReceiver {
                                 }
                                 match reorder.push(audio) {
                                     PushOutcome::Ready(frames) => {
+                                        let freshly_in_order = frames.len() == 1;
                                         for frame in frames {
                                             emit_audio(
                                                 frame,
                                                 arrival,
+                                                freshly_in_order,
                                                 &mut current_rate,
                                                 &mut clock,
                                                 &events_tx,
@@ -224,10 +248,11 @@ impl SongcastReceiver {
                                     PushOutcome::Resynced(frame) => {
                                         clock.reset(frame.sample_rate);
                                         current_rate = frame.sample_rate;
-                                        let _ = events_tx.send(ReceiverEvent::Resynced);
+                                        let _ = events_tx.try_send(ReceiverEvent::Resynced);
                                         emit_audio(
                                             frame,
                                             arrival,
+                                            true,
                                             &mut current_rate,
                                             &mut clock,
                                             &events_tx,
@@ -258,7 +283,7 @@ impl SongcastReceiver {
             resolved_uri,
             events_rx,
             shutdown_tx,
-            task,
+            task: Some(task),
         })
     }
 
@@ -273,32 +298,43 @@ impl SongcastReceiver {
     }
 
     /// Stop the receiver and (in unicast mode) send `OhmMessage::Leave`.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
 fn emit_audio(
     frame: OhmAudio,
     arrival: Instant,
+    freshly_in_order: bool,
     current_rate: &mut u32,
     clock: &mut ClockSync,
-    events_tx: &mpsc::UnboundedSender<ReceiverEvent>,
+    events_tx: &mpsc::Sender<ReceiverEvent>,
 ) {
     if frame.sample_rate != *current_rate && frame.sample_rate > 0 {
         clock.reset(frame.sample_rate);
         *current_rate = frame.sample_rate;
     }
-    let playout_at = if frame.flags.is_timestamped() {
+    let is_halt = frame.flags.is_halt();
+    // Only feed freshly-arrived, in-order, non-resent frames into ClockSync so
+    // late resends and drained reorder backlogs do not corrupt offset/skew.
+    let playout_at = if freshly_in_order && !frame.flags.is_resent() && frame.flags.is_timestamped()
+    {
         clock.observe(frame.network_timestamp, frame.media_latency, arrival)
     } else {
         arrival
     };
     let skew_ppm = clock.skew_ppm();
-    let _ = events_tx.send(ReceiverEvent::Audio {
+    let _ = events_tx.try_send(ReceiverEvent::Audio {
         frame,
         playout_at,
         skew_ppm,
     });
+    // Reset ClockSync after a HALT frame so long pauses (>174s) cannot wrap timestamps negative.
+    if is_halt {
+        clock.reset(*current_rate);
+    }
 }

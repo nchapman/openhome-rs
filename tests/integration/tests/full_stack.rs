@@ -15,7 +15,7 @@ use openhome_core::{
 };
 use openhome_server::{
     ActionResult, InfoService, MemoryRenderer, OpenHomeServer, ProductService, ReceiverService,
-    SsdpConfig,
+    ServerNotifier, SsdpConfig,
 };
 use openhome_songcast::{
     AudioFormat, ReceiverConfig, ReceiverEvent, SenderConfig, SongcastReceiver, SongcastSender,
@@ -112,7 +112,7 @@ struct SongcastReceiverBridge {
     inner: MemoryRenderer,
     state: Mutex<ReceiverBridgeState>,
     frames: Mutex<Vec<CapturedFrame>>,
-    server_ref: Mutex<Option<Arc<OpenHomeServer>>>,
+    notifier: Mutex<Option<ServerNotifier>>,
 }
 
 struct ReceiverBridgeState {
@@ -139,18 +139,18 @@ impl SongcastReceiverBridge {
                 active_rx: None,
             }),
             frames: Mutex::new(Vec::new()),
-            server_ref: Mutex::new(None),
+            notifier: Mutex::new(None),
         })
     }
 
-    fn attach_server(&self, server: Arc<OpenHomeServer>) {
-        *self.server_ref.lock().unwrap() = Some(server);
+    fn attach_notifier(&self, notifier: ServerNotifier) {
+        *self.notifier.lock().unwrap() = Some(notifier);
     }
 
     fn notify_receiver_and_info(&self) {
-        if let Some(srv) = self.server_ref.lock().unwrap().as_ref() {
-            srv.notify_receiver();
-            srv.notify_info();
+        if let Some(notifier) = self.notifier.lock().unwrap().as_ref() {
+            notifier.notify_receiver();
+            notifier.notify_info();
         }
     }
 
@@ -384,7 +384,7 @@ impl ReceiverService for BridgeReceiverSvc {
 }
 
 struct ReceiverRoom {
-    server: Arc<OpenHomeServer>,
+    server: OpenHomeServer,
     bridge: Arc<SongcastReceiverBridge>,
 }
 
@@ -403,8 +403,7 @@ impl ReceiverRoom {
             .await
             .expect("start receiver OpenHomeServer");
 
-        let server = Arc::new(server);
-        bridge.attach_server(Arc::clone(&server));
+        bridge.attach_notifier(server.notifier());
         Self { server, bridge }
     }
 
@@ -412,12 +411,7 @@ impl ReceiverRoom {
         if let Some(task) = self.bridge.stop_active_receiver() {
             let _ = task.await;
         }
-        *self.bridge.server_ref.lock().unwrap() = None;
-        Arc::try_unwrap(self.server)
-            .ok()
-            .expect("no outstanding Arc<OpenHomeServer> refs")
-            .shutdown()
-            .await;
+        self.server.shutdown().await;
     }
 }
 

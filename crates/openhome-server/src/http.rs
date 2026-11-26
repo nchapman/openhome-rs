@@ -39,8 +39,8 @@ pub(crate) async fn serve_http(
     loop {
         let accept = tokio::select! {
             res = listener.accept() => res,
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
                     break;
                 }
                 continue;
@@ -68,8 +68,8 @@ pub(crate) async fn serve_http(
             tokio::pin!(conn);
             tokio::select! {
                 _ = conn.as_mut() => {}
-                _ = conn_shutdown.changed() => {
-                    if *conn_shutdown.borrow() {
+                res = conn_shutdown.changed() => {
+                    if res.is_err() || *conn_shutdown.borrow() {
                         conn.as_mut().graceful_shutdown();
                         let _ = conn.await;
                     }

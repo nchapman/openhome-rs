@@ -100,31 +100,53 @@ impl OpenHomeDevice {
                 .is_ok()
     }
 
-    /// Resolve a service's `eventSubURL` by `serviceType` or `serviceId`.
+    /// Resolve a service's `eventSubURL` by `serviceType` (matching version families like
+    /// `Product:1..4`, `Volume:1..4`, `Sender:1..2`) or `serviceId`.
     pub fn event_sub_url(&self, service_type_or_id: &'static str) -> Result<String, ClientError> {
-        let svc = self
-            .description
-            .find_service(service_type_or_id)
-            .or_else(|| self.description.find_service_by_id(service_type_or_id))
-            .ok_or(ClientError::MissingService(service_type_or_id))?;
+        let svc = self.find_service_matching(service_type_or_id)?;
         if svc.event_sub_url.is_empty() {
             return Err(ClientError::MissingService(service_type_or_id));
         }
         resolve_url(self.base_url(), &svc.event_sub_url)
     }
 
-    /// Fetch a service's SCPD XML document by `serviceType` or `serviceId`.
+    /// Fetch a service's SCPD XML document by `serviceType` (matching version families)
+    /// or `serviceId`.
     pub async fn scpd_xml(&self, service_type_or_id: &'static str) -> Result<String, ClientError> {
-        let svc = self
-            .description
-            .find_service(service_type_or_id)
-            .or_else(|| self.description.find_service_by_id(service_type_or_id))
-            .ok_or(ClientError::MissingService(service_type_or_id))?;
+        let svc = self.find_service_matching(service_type_or_id)?;
         if svc.scpd_url.is_empty() {
             return Err(ClientError::MissingService(service_type_or_id));
         }
         let url = resolve_url(self.base_url(), &svc.scpd_url)?;
         self.http.get_text(&url).await
+    }
+
+    fn find_service_matching(
+        &self,
+        service_type_or_id: &'static str,
+    ) -> Result<&ServiceDescription, ClientError> {
+        if let Some(svc) = self
+            .description
+            .find_service(service_type_or_id)
+            .or_else(|| self.description.find_service_by_id(service_type_or_id))
+        {
+            return Ok(svc);
+        }
+        // Match OpenHome service version families (e.g. Product:1 query matches Product:4).
+        if let Some((prefix, _ver)) = service_type_or_id.rsplit_once(':')
+            && prefix.starts_with("urn:av-openhome-org:service:")
+        {
+            let family = format!("{prefix}:");
+            if let Some(svc) = self
+                .description
+                .services
+                .iter()
+                .find(|s| s.service_type.starts_with(&family))
+            {
+                return Ok(svc);
+            }
+        }
+        Err(ClientError::MissingService(service_type_or_id))
     }
 
     fn resolve_control_url(
@@ -252,5 +274,60 @@ impl OpenHomeDevice {
                     .find(|s| s.service_type.starts_with(type_prefix))
             })
             .ok_or(ClientError::MissingService(expected_urn))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_sub_url_matches_versioned_openhome_service_families() {
+        let desc = DeviceDescription {
+            url_base: None,
+            device_type: "urn:schemas-upnp-org:device:MediaRenderer:1".into(),
+            friendly_name: "Linn Klimax DS".into(),
+            manufacturer: "Linn".into(),
+            manufacturer_url: None,
+            model_description: None,
+            model_name: "Klimax DS".into(),
+            model_number: None,
+            model_url: None,
+            serial_number: None,
+            udn: "uuid:linn-ds".into(),
+            presentation_url: None,
+            services: vec![
+                ServiceDescription {
+                    service_type: "urn:av-openhome-org:service:Product:4".into(),
+                    service_id: "urn:av-openhome-org:serviceId:Product".into(),
+                    scpd_url: "/scpd/Product.xml".into(),
+                    control_url: "/ctl/Product".into(),
+                    event_sub_url: "/evt/Product".into(),
+                },
+                ServiceDescription {
+                    service_type: "urn:av-openhome-org:service:Volume:4".into(),
+                    service_id: "urn:av-openhome-org:serviceId:Volume".into(),
+                    scpd_url: "/scpd/Volume.xml".into(),
+                    control_url: "/ctl/Volume".into(),
+                    event_sub_url: "/evt/Volume".into(),
+                },
+            ],
+        };
+        let dev = OpenHomeDevice::from_description(
+            "http://192.168.1.10:55178/desc.xml",
+            desc,
+            HttpClient::default(),
+        );
+
+        assert!(dev.is_openhome_device());
+        assert_eq!(
+            dev.event_sub_url(SERVICE_PRODUCT_1).unwrap(),
+            "http://192.168.1.10:55178/evt/Product"
+        );
+        assert_eq!(
+            dev.event_sub_url(SERVICE_VOLUME_1).unwrap(),
+            "http://192.168.1.10:55178/evt/Volume"
+        );
+        assert!(dev.event_sub_url(SERVICE_SENDER_1).is_err());
     }
 }

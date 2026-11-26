@@ -43,4 +43,4 @@ pub use uri::{
     NULL_URI, OHM_PORT, OHZ_MULTICAST_ADDR, OHZ_MULTICAST_IP, OHZ_PORT, SongcastUri,
     encode_sender_metadata, sender_channel_addr, zone_discovery_uri,
 };
-pub use zone::{ZoneResponder, query_preset, resolve_zone};
+pub use zone::{ZoneResponder, query_preset, query_preset_on, resolve_zone, resolve_zone_on};

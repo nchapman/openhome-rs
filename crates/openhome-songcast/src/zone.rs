@@ -26,7 +26,21 @@ pub struct ZoneResponder {
     local_addr: SocketAddr,
     table: Arc<RwLock<ZoneTable>>,
     shutdown_tx: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for ZoneResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneResponder")
+            .field("local_addr", &self.local_addr)
+            .finish()
+    }
+}
+
+impl Drop for ZoneResponder {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 impl ZoneResponder {
@@ -47,8 +61,8 @@ impl ZoneResponder {
             let mut buf = [0u8; 4096];
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -85,7 +99,7 @@ impl ZoneResponder {
             local_addr,
             table,
             shutdown_tx,
-            task,
+            task: Some(task),
         })
     }
 
@@ -117,29 +131,43 @@ impl ZoneResponder {
     }
 
     /// Shut down the responder task cleanly.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
-/// Resolve an OHZ zone name to its active [`SongcastUri`] by querying `endpoint`.
+/// Resolve an OHZ zone name to its active [`SongcastUri`] by querying `endpoint`
+/// on the default multicast interface (`0.0.0.0`).
+pub async fn resolve_zone(
+    endpoint: SocketAddrV4,
+    zone: &str,
+    timeout: Duration,
+) -> Result<SongcastUri, SongcastError> {
+    resolve_zone_on(endpoint, zone, Ipv4Addr::UNSPECIFIED, timeout).await
+}
+
+/// Resolve an OHZ zone name to its active [`SongcastUri`] by querying `endpoint`
+/// using the specified local IPv4 `interface`.
 ///
 /// For unicast `endpoint`s, replies are accepted only from `endpoint`.
 /// Note: per the OpenHome Songcast specification, multicast OHZ discovery is
 /// unauthenticated and intended for trusted local networks only.
-pub async fn resolve_zone(
+pub async fn resolve_zone_on(
     endpoint: SocketAddrV4,
     zone: &str,
+    interface: Ipv4Addr,
     timeout: Duration,
 ) -> Result<SongcastUri, SongcastError> {
     let is_multicast = endpoint.ip().is_multicast();
     // Per ohSongcast / ohPipeline, OHZ ZoneUri replies are multicast to the OHZ group
     // (239.255.255.250:51972), so multicast queries must join the group to receive them.
     let sock = if is_multicast {
-        bind_udp_v4(endpoint, Ipv4Addr::UNSPECIFIED, 2)?
+        bind_udp_v4(endpoint, interface, 2)?
     } else {
-        UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?
+        UdpSocket::bind(SocketAddrV4::new(interface, 0)).await?
     };
     let query = OhzMessage::ZoneQuery {
         zone: zone.to_string(),
@@ -188,11 +216,21 @@ pub async fn query_preset(
     preset: u32,
     timeout: Duration,
 ) -> Result<Option<String>, SongcastError> {
+    query_preset_on(endpoint, preset, Ipv4Addr::UNSPECIFIED, timeout).await
+}
+
+/// Query DIDL-Lite metadata for a Songcast preset index via OHZ on `interface`.
+pub async fn query_preset_on(
+    endpoint: SocketAddrV4,
+    preset: u32,
+    interface: Ipv4Addr,
+    timeout: Duration,
+) -> Result<Option<String>, SongcastError> {
     let is_multicast = endpoint.ip().is_multicast();
     let sock = if is_multicast {
-        bind_udp_v4(endpoint, Ipv4Addr::UNSPECIFIED, 2)?
+        bind_udp_v4(endpoint, interface, 2)?
     } else {
-        UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?
+        UdpSocket::bind(SocketAddrV4::new(interface, 0)).await?
     };
     let query = OhzMessage::PresetQuery { preset }.encode()?;
 

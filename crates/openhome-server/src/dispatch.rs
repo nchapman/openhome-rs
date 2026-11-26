@@ -258,12 +258,20 @@ impl ServiceRegistry {
     }
 }
 
+const COUPLED_TRANSPORT_SLUGS: &[&str] = &[
+    SLUG_PRODUCT,
+    SLUG_PLAYLIST,
+    SLUG_RECEIVER,
+    SLUG_INFO,
+    SLUG_TIME,
+];
+
 fn affected_slugs(slug: &str) -> &'static [&'static str] {
     match slug {
         SLUG_VOLUME => &[SLUG_VOLUME],
-        SLUG_PRODUCT => &[SLUG_PRODUCT, SLUG_INFO],
-        SLUG_PLAYLIST => &[SLUG_PLAYLIST, SLUG_INFO, SLUG_TIME],
-        SLUG_RECEIVER => &[SLUG_RECEIVER, SLUG_INFO, SLUG_TIME],
+        // Product, Playlist, and Receiver are cross-coupled: Play/SeekId auto-selects
+        // source & wakes from standby, while SetSourceIndex/SetStandby stops playback.
+        SLUG_PRODUCT | SLUG_PLAYLIST | SLUG_RECEIVER => COUPLED_TRANSPORT_SLUGS,
         SLUG_INFO => &[SLUG_INFO],
         SLUG_TIME => &[SLUG_TIME],
         SLUG_SENDER => &[SLUG_SENDER],
@@ -1070,7 +1078,7 @@ mod tests {
             )
             .unwrap();
         assert!(prod_mut.mutated);
-        assert_eq!(prod_mut.mutated_services, &[SLUG_PRODUCT, SLUG_INFO]);
+        assert_eq!(prod_mut.mutated_services, COUPLED_TRANSPORT_SLUGS);
 
         let pl_mut = reg
             .dispatch_soap(
@@ -1080,10 +1088,7 @@ mod tests {
             )
             .unwrap();
         assert!(pl_mut.mutated);
-        assert_eq!(
-            pl_mut.mutated_services,
-            &[SLUG_PLAYLIST, SLUG_INFO, SLUG_TIME]
-        );
+        assert_eq!(pl_mut.mutated_services, COUPLED_TRANSPORT_SLUGS);
 
         let full = ServiceRegistry {
             receiver: Some(renderer.clone()),
@@ -1097,9 +1102,6 @@ mod tests {
             )
             .unwrap();
         assert!(rx_mut.mutated);
-        assert_eq!(
-            rx_mut.mutated_services,
-            &[SLUG_RECEIVER, SLUG_INFO, SLUG_TIME]
-        );
+        assert_eq!(rx_mut.mutated_services, COUPLED_TRANSPORT_SLUGS);
     }
 }
