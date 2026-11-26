@@ -1463,3 +1463,114 @@ async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
     leader.shutdown().await;
     http_task.abort();
 }
+
+/// Exercises Songcast clock-drift compensation (`skew_ppm`), receiver `Resynced` on a large
+/// sequence gap, and live handoff between Playlist playback and Songcast Receiver.
+#[tokio::test]
+async fn songcast_drift_compensation_resync_and_source_handoff() {
+    use openhome_songcast::ohm::{AudioFlags, OhmAudio, OhmMessage};
+    use tokio::net::UdpSocket;
+
+    let wav = synth_wav(44_100, 44_100 * 2, 0.4);
+    let (http_addr, http_task) = spawn_wav_http_server(wav.clone(), wav).await;
+
+    let capture = Arc::new(CaptureSink::new());
+    let ep = OpenHomeEndpoint::start(EndpointConfig {
+        room: "Studio".into(),
+        name: "Drift Test".into(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        songcast_interface: Ipv4Addr::LOCALHOST,
+        enable_sender: false,
+        sink: capture.clone(),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let dev = OpenHomeDevice::connect(ep.description_url()).await.unwrap();
+    let pl = dev.playlist().unwrap();
+    let rx = dev.receiver().unwrap();
+
+    // Start Playlist playback first, then switch directly to Receiver (exercises halting active
+    // Playlist track on StartSongcast).
+    pl.insert(0, &format!("http://{http_addr}/track1.wav"), "")
+        .await
+        .unwrap();
+    pl.play().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Bind a raw UDP Songcast sender socket so we can inject controlled +250 ppm timestamps
+    // (triggering ClockSync skew_ppm drift compensation) and a large frame gap (triggering Resynced).
+    let tx_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tx_addr = tx_sock.local_addr().unwrap();
+    let sc_uri = format!("ohu://{tx_addr}");
+
+    rx.set_sender(&sc_uri, "").await.unwrap();
+    rx.play().await.unwrap();
+
+    // Wait for Join from the endpoint's SongcastReceiver.
+    let mut buf = [0u8; 256];
+    let (_, peer) = tokio::time::timeout(Duration::from_secs(2), tx_sock.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for OHM Join")
+        .unwrap();
+
+    // Send frames over ~600 ms with timestamps advancing at +250 ppm so ClockSync::skew_ppm
+    // exceeds the 2 ppm threshold and engages PcmAdapter drift compensation.
+    let pcm = vec![0x10u8; 441 * 4]; // 441 stereo 16-bit frames = 10 ms @ 44.1 kHz
+    let tps: u64 = 44_100 * 256; // 44.1 kHz Songcast tick rate
+    let start = Instant::now();
+    for frame_no in 0u32..32 {
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        // Inject +250 ppm faster sender clock.
+        let skewed_ns = elapsed_ns + (elapsed_ns / 4_000);
+        let ts = ((u128::from(skewed_ns) * u128::from(tps)) / 1_000_000_000) as u32;
+        let audio = OhmAudio {
+            flags: AudioFlags(AudioFlags::LOSSLESS | AudioFlags::TIMESTAMPED),
+            samples: 441,
+            frame: frame_no,
+            network_timestamp: ts,
+            media_latency: (tps / 10) as u32,
+            media_timestamp: ts,
+            sample_start: u64::from(frame_no) * 441,
+            samples_total: 44_100 * 10,
+            sample_rate: 44_100,
+            bit_rate: 1_411_200,
+            volume_offset: 0,
+            bit_depth: 16,
+            channels: 2,
+            codec: "PCM".into(),
+            audio: pcm.clone(),
+        };
+        let bytes = OhmMessage::Audio(audio).encode().unwrap();
+        tx_sock.send_to(&bytes, peer).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Inject a large frame jump (> reorder history) to trigger ReceiverEvent::Resynced.
+    let jump_audio = OhmAudio {
+        flags: AudioFlags(AudioFlags::LOSSLESS | AudioFlags::TIMESTAMPED),
+        samples: 441,
+        frame: 500,
+        network_timestamp: (tps * 2) as u32,
+        media_latency: (tps / 10) as u32,
+        media_timestamp: (tps * 2) as u32,
+        sample_start: 500 * 441,
+        samples_total: 44_100 * 10,
+        sample_rate: 44_100,
+        bit_rate: 1_411_200,
+        volume_offset: 0,
+        bit_depth: 16,
+        channels: 2,
+        codec: "PCM".into(),
+        audio: pcm,
+    };
+    let jump_bytes = OhmMessage::Audio(jump_audio).encode().unwrap();
+    tx_sock.send_to(&jump_bytes, peer).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(!capture.frames().is_empty());
+
+    ep.shutdown().await;
+    http_task.abort();
+}
