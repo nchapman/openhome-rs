@@ -324,6 +324,48 @@ pub fn songcast_pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>)
     pcm_be_into_f32(bytes, bit_depth, out);
 }
 
+/// Convert interleaved normalized `f32` samples (`-1.0..=1.0`) into big-endian signed integer
+/// PCM bytes (`bit_depth` of `16` or `24`) for Songcast `OhmAudio` transmission.
+pub fn f32_to_pcm_be(samples: &[f32], bit_depth: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    f32_into_pcm_be(samples, bit_depth, &mut out);
+    out
+}
+
+/// Convert interleaved normalized `f32` samples into big-endian signed integer PCM bytes in `out`
+/// (reusing its allocation).
+pub fn f32_into_pcm_be(samples: &[f32], bit_depth: u8, out: &mut Vec<u8>) {
+    out.clear();
+    match bit_depth {
+        16 => {
+            out.reserve(samples.len() * 2);
+            for &s in samples {
+                let clean = if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let v = (clean * 32_767.0).round() as i16;
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        24 => {
+            out.reserve(samples.len() * 3);
+            for &s in samples {
+                let clean = if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let v = (clean * 8_388_607.0).round() as i32;
+                let be = v.to_be_bytes();
+                out.extend_from_slice(&be[1..4]);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Lock-free single-producer, single-consumer `f32` ring buffer built with safe atomics
 /// (zero `unsafe` code, channel-aligned capacity so audio frames are never split).
 pub struct SpscRingBuffer {
@@ -457,6 +499,7 @@ pub struct PcmAdapter {
     in_channels: usize,
     out_rate: u32,
     out_channels: usize,
+    rate_adjust_ppm: f64,
     phase: f64,
     prev_frame: Vec<f32>,
     has_prev: bool,
@@ -472,6 +515,7 @@ impl PcmAdapter {
             in_channels: usize::from(input.channels.max(1)),
             out_rate: out_rate.max(1),
             out_channels: out_ch,
+            rate_adjust_ppm: 0.0,
             phase: 0.0,
             prev_frame: vec![0.0; out_ch],
             has_prev: false,
@@ -479,9 +523,23 @@ impl PcmAdapter {
         }
     }
 
-    /// True if no channel remixing or resampling is required.
+    /// Apply subtle clock-drift compensation in parts-per-million (clamped to `-500..=500` ppm).
+    ///
+    /// Positive `ppm` consumes input slightly faster (sender clock faster than local);
+    /// negative `ppm` consumes input slightly slower (sender clock slower than local).
+    pub fn set_rate_adjust_ppm(&mut self, ppm: f64) {
+        self.rate_adjust_ppm = if ppm.is_finite() {
+            ppm.clamp(-500.0, 500.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// True if no channel remixing, resampling, or clock-drift compensation is required.
     pub fn is_passthrough(&self) -> bool {
-        self.in_rate == self.out_rate && self.in_channels == self.out_channels
+        self.in_rate == self.out_rate
+            && self.in_channels == self.out_channels
+            && self.rate_adjust_ppm.abs() < 0.5
     }
 
     /// Reset resampler interpolation state (e.g. on flush/seek).
@@ -546,13 +604,14 @@ impl PcmAdapter {
             &self.remix_scratch
         };
 
-        if self.in_rate == self.out_rate {
+        if self.in_rate == self.out_rate && self.rate_adjust_ppm.abs() < 0.5 {
             out.extend_from_slice(src);
             return;
         }
 
-        // Step 2: linear interpolation resampler from `in_rate` to `out_rate`.
-        let ratio = (self.in_rate as f64) / (self.out_rate as f64);
+        // Step 2: linear interpolation resampler from `in_rate` to `out_rate` with optional clock-drift PPM pull.
+        let ratio =
+            (self.in_rate as f64 / self.out_rate as f64) * (1.0 + self.rate_adjust_ppm * 1e-6);
         let oc = self.out_channels;
         if !self.has_prev {
             self.prev_frame.copy_from_slice(&src[..oc]);
@@ -656,6 +715,21 @@ mod tests {
         assert!((s32[0] - 0.5).abs() < 1e-6);
 
         assert!(songcast_pcm_be_to_f32(&[1, 2, 3], 8).is_empty());
+
+        // Round-trip f32 -> big-endian 16-bit and 24-bit PCM -> f32 (with NaN guard).
+        let enc16 = f32_to_pcm_be(&[0.5, -0.5, f32::NAN], 16);
+        let dec16 = pcm_be_to_f32(&enc16, 16);
+        assert_eq!(dec16.len(), 3);
+        assert!((dec16[0] - 0.5).abs() < 1e-3);
+        assert!((dec16[1] + 0.5).abs() < 1e-3);
+        assert_eq!(dec16[2], 0.0);
+
+        let enc24 = f32_to_pcm_be(&[0.25, -0.25], 24);
+        let dec24 = pcm_be_to_f32(&enc24, 24);
+        assert_eq!(dec24.len(), 2);
+        assert!((dec24[0] - 0.25).abs() < 1e-5);
+        assert!((dec24[1] + 0.25).abs() < 1e-5);
+        assert!(f32_to_pcm_be(&[0.5], 8).is_empty());
     }
 
     #[test]
@@ -729,5 +803,20 @@ mod tests {
         let mut stereo_to_quad = PcmAdapter::new(PcmSpec::new(48_000, 2, 16), 48_000, 4);
         stereo_to_quad.process(&[0.3, -0.3], &mut out);
         assert_eq!(out, vec![0.3, -0.3, 0.0, 0.0]);
+
+        // Clock-drift compensation: +500 ppm consumes input slightly faster (fewer output frames).
+        let mut drift = PcmAdapter::new(PcmSpec::new(48_000, 2, 16), 48_000, 2);
+        assert!(drift.is_passthrough());
+        drift.set_rate_adjust_ppm(500.0);
+        assert!(!drift.is_passthrough());
+        let src = vec![0.5f32; 4_000 * 2]; // 4000 stereo frames
+        drift.process(&src, &mut out);
+        let out_frames = out.len() / 2;
+        assert!(
+            (3_995..4_000).contains(&out_frames),
+            "expected ~3998 frames at +500ppm, got {out_frames}"
+        );
+        drift.set_rate_adjust_ppm(f64::NAN);
+        assert!(drift.is_passthrough());
     }
 }

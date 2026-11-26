@@ -1,20 +1,20 @@
 //! High-level [`OpenHomeEndpoint`] bridging `openhome-server` services and [`PlaybackEngine`].
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use openhome_audio::{AudioSink, NullSink, is_http_uri};
 use openhome_core::Fault;
 use openhome_core::types::{
-    DeviceAttributes, InfoCounters, ProductInfo, ReceiverState, Source, SourceType, TrackDetails,
-    TrackEntry, TrackTime, TransportState, VolumeCharacteristics, VolumeState,
+    DeviceAttributes, InfoCounters, ProductInfo, ReceiverState, SenderStatus, Source, SourceType,
+    TrackDetails, TrackEntry, TrackTime, TransportState, VolumeCharacteristics, VolumeState,
 };
 use openhome_server::{
     ActionResult, InfoService, MemoryRenderer, OpenHomeServer, PlaylistService, ProductService,
-    ReceiverService, ServerNotifier, SsdpConfig, TimeService, VolumeService,
+    ReceiverService, SenderService, ServerNotifier, SsdpConfig, TimeService, VolumeService,
 };
-use openhome_songcast::SongcastUri;
+use openhome_songcast::{SenderConfig, SongcastSender, SongcastUri, encode_sender_metadata};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -55,8 +55,13 @@ pub struct EndpointConfig {
     pub advertise_host: Option<String>,
     /// SSDP discovery configuration.
     pub ssdp: SsdpConfig,
-    /// Local IPv4 interface for Songcast Receiver sockets.
+    /// Local IPv4 interface for Songcast Receiver/Sender sockets.
     pub songcast_interface: Ipv4Addr,
+    /// Whether to expose the OpenHome `Sender:1` service and rebroadcast Playlist audio
+    /// over Songcast so other rooms can group with this endpoint as multiroom leader.
+    pub enable_sender: bool,
+    /// Optional explicit UDP bind address for the Songcast Sender (defaults to ephemeral unicast).
+    pub songcast_sender_addr: Option<SocketAddrV4>,
     /// Whether `Playlist.Insert` is allowed to open `file://` or local filesystem paths.
     ///
     /// Defaults to `false` (only `http://` and `https://` URIs are accepted) so unauthenticated
@@ -90,6 +95,8 @@ impl Default for EndpointConfig {
             advertise_host: None,
             ssdp: SsdpConfig::disabled(),
             songcast_interface: Ipv4Addr::UNSPECIFIED,
+            enable_sender: true,
+            songcast_sender_addr: None,
             allow_local_files: false,
             sink: Arc::new(NullSink::realtime()),
             on_error: None,
@@ -103,6 +110,7 @@ struct EndpointCore {
     generation: Arc<AtomicU64>,
     loaded_track_id: AtomicU32,
     songcast_interface: Ipv4Addr,
+    sender_enabled: bool,
     allow_local_files: bool,
     on_error: Option<ErrorCallback>,
     notifier: OnceLock<ServerNotifier>,
@@ -144,10 +152,35 @@ impl EndpointCore {
         }
     }
 
+    /// Synchronize OpenHome `Sender:1` (`Status` & `Audio`) with Playlist/Standby/Source state,
+    /// matching `ohPipeline`'s `Sender::NotifyPipelineState` & `OhmSender::UpdateStatus`.
+    fn sync_sender_state(&self) {
+        if !self.sender_enabled {
+            return;
+        }
+        let status = if self.state.standby() || !self.is_playlist_active() {
+            SenderStatus::Disabled
+        } else {
+            SenderStatus::Enabled
+        };
+        let audio = status == SenderStatus::Enabled
+            && PlaylistService::transport_state(&self.state) == TransportState::Playing;
+        if self.state.status() != status || self.state.audio() != audio {
+            let pres = self.state.presentation_url();
+            let meta = self.state.metadata();
+            let attrs = SenderService::attributes(&self.state);
+            self.state.set_sender_info(pres, meta, audio, status, attrs);
+            if let Some(n) = self.notifier.get() {
+                n.notify_sender();
+            }
+        }
+    }
+
     fn stop_engine(&self) {
         self.next_generation();
         self.loaded_track_id.store(0, Ordering::Release);
         self.engine.send(EngineCommand::Stop);
+        self.sync_sender_state();
     }
 
     /// Start decoding the current playlist track (if any) in `PlaybackEngine`.
@@ -164,11 +197,18 @@ impl EndpointCore {
             }
             let generation = self.next_generation();
             self.loaded_track_id.store(id, Ordering::Release);
+            if self.sender_enabled {
+                self.engine.send(EngineCommand::SetTrackMetadata {
+                    uri: entry.uri.clone(),
+                    metadata: entry.metadata,
+                });
+            }
             self.engine.send(EngineCommand::Load {
                 generation,
                 uri: entry.uri,
                 paused,
             });
+            self.sync_sender_state();
         }
     }
 
@@ -179,6 +219,7 @@ impl EndpointCore {
                     return;
                 }
                 self.state.set_transport_state(state);
+                self.sync_sender_state();
                 self.notify_playback();
             }
             EngineEvent::Details {
@@ -272,7 +313,7 @@ impl ProductService for EndpointCore {
     }
 
     fn attributes(&self) -> DeviceAttributes {
-        self.state.attributes()
+        ProductService::attributes(&self.state)
     }
 
     fn sources(&self) -> Vec<Source> {
@@ -289,6 +330,7 @@ impl ProductService for EndpointCore {
         if index != prev {
             self.stop_engine();
         }
+        self.sync_sender_state();
         Ok(())
     }
 
@@ -301,6 +343,7 @@ impl ProductService for EndpointCore {
         if standby {
             self.stop_engine();
         }
+        self.sync_sender_state();
         Ok(())
     }
 
@@ -634,11 +677,46 @@ impl ReceiverService for EndpointCore {
     }
 }
 
-/// Running self-contained OpenHome Media + Songcast player.
+impl SenderService for EndpointCore {
+    fn presentation_url(&self) -> String {
+        self.state.presentation_url()
+    }
+
+    fn metadata(&self) -> String {
+        self.state.metadata()
+    }
+
+    fn audio(&self) -> bool {
+        self.state.audio()
+    }
+
+    fn status(&self) -> SenderStatus {
+        self.state.status()
+    }
+
+    fn attributes(&self) -> String {
+        SenderService::attributes(&self.state)
+    }
+}
+
+fn default_outbound_ipv4() -> Ipv4Addr {
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0")
+        && sock.connect("192.0.2.1:80").is_ok()
+        && let Ok(SocketAddr::V4(v4)) = sock.local_addr()
+        && !v4.ip().is_unspecified()
+    {
+        return *v4.ip();
+    }
+    Ipv4Addr::LOCALHOST
+}
+
+/// Running self-contained OpenHome Media + Songcast endpoint.
 pub struct OpenHomeEndpoint {
     server: Option<OpenHomeServer>,
     local_addr: SocketAddr,
     description_url: String,
+    sender_uri: Option<String>,
+    sender: Option<Arc<SongcastSender>>,
     core: Arc<EndpointCore>,
     pump_stop_tx: watch::Sender<bool>,
     pump_task: Option<JoinHandle<()>>,
@@ -649,6 +727,7 @@ impl std::fmt::Debug for OpenHomeEndpoint {
         f.debug_struct("OpenHomeEndpoint")
             .field("local_addr", &self.local_addr)
             .field("description_url", &self.description_url)
+            .field("sender_uri", &self.sender_uri)
             .finish()
     }
 }
@@ -658,24 +737,60 @@ impl OpenHomeEndpoint {
     pub async fn start(config: EndpointConfig) -> Result<Self, EndpointError> {
         let runtime = tokio::runtime::Handle::current();
         let state = MemoryRenderer::new(&config.room, &config.name);
-        // Only advertise services we actually register (no SenderService).
+
+        let sender = if config.enable_sender {
+            let bind_addr = config
+                .songcast_sender_addr
+                .unwrap_or_else(|| SocketAddrV4::new(config.songcast_interface, 0));
+            let advertise_ip = config
+                .advertise_host
+                .as_deref()
+                .and_then(|h| h.parse::<Ipv4Addr>().ok())
+                .or_else(|| match config.bind_addr.ip() {
+                    IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+                    _ => None,
+                })
+                .unwrap_or_else(default_outbound_ipv4);
+            let sc_sender = SongcastSender::bind(SenderConfig {
+                bind_addr,
+                advertise_ip: Some(advertise_ip),
+                interface: config.songcast_interface,
+                ..SenderConfig::default()
+            })
+            .await?;
+            let sc_uri = sc_sender.uri();
+            let uri_str = sc_uri.to_string();
+            let meta = encode_sender_metadata(
+                &config.room,
+                &uri_str,
+                matches!(sc_uri, SongcastUri::Multicast(_)),
+                None,
+            );
+            state.set_sender_info("", meta, false, SenderStatus::Enabled, "");
+            Some(Arc::new(sc_sender))
+        } else {
+            None
+        };
+        let sender_uri = sender.as_ref().map(|s| s.uri().to_string());
+
         state.set_attributes(DeviceAttributes {
             info: true,
             time: true,
             volume: true,
-            sender: false,
+            sender: sender.is_some(),
             receiver: true,
             credentials: false,
         });
         state.set_playlist_protocol_info(PLAYER_PROTOCOL_INFO);
 
         let generation = Arc::new(AtomicU64::new(0));
-        let (engine, mut ev_rx) = PlaybackEngine::spawn_with_options(
+        let (engine, mut ev_rx) = PlaybackEngine::spawn_with_sender(
             config.sink,
             runtime,
             Arc::clone(&generation),
             config.allow_local_files,
             state.characteristics(),
+            sender.clone(),
         );
         engine.send(EngineCommand::SetVolume(state.state()));
 
@@ -685,6 +800,7 @@ impl OpenHomeEndpoint {
             generation,
             loaded_track_id: AtomicU32::new(0),
             songcast_interface: config.songcast_interface,
+            sender_enabled: sender.is_some(),
             allow_local_files: config.allow_local_files,
             on_error: config.on_error,
             notifier: OnceLock::new(),
@@ -699,6 +815,9 @@ impl OpenHomeEndpoint {
             .bind_addr(config.bind_addr)
             .ssdp(config.ssdp);
 
+        if sender.is_some() {
+            builder = builder.sender(Arc::clone(&core) as Arc<dyn SenderService>);
+        }
         if let Some(udn) = config.udn {
             builder = builder.udn(udn);
         }
@@ -734,6 +853,8 @@ impl OpenHomeEndpoint {
             server: Some(server),
             local_addr,
             description_url,
+            sender_uri,
+            sender,
             core,
             pump_stop_tx,
             pump_task: Some(pump_task),
@@ -750,7 +871,12 @@ impl OpenHomeEndpoint {
         &self.description_url
     }
 
-    /// Gracefully shut down the HTTP/SSDP server, event pump, and audio playback worker.
+    /// Live Songcast Sender URI (`ohu://...` or `ohm://...`) if `enable_sender` is enabled.
+    pub fn sender_uri(&self) -> Option<&str> {
+        self.sender_uri.as_deref()
+    }
+
+    /// Gracefully shut down the HTTP/SSDP server, event pump, audio playback worker, and Songcast sender.
     pub async fn shutdown(mut self) {
         if let Some(server) = self.server.take() {
             server.shutdown().await;
@@ -760,6 +886,11 @@ impl OpenHomeEndpoint {
             let _ = task.await;
         }
         self.core.engine.shutdown_async().await;
+        if let Some(sender) = self.sender.take()
+            && let Ok(owned) = Arc::try_unwrap(sender)
+        {
+            owned.shutdown().await;
+        }
     }
 }
 

@@ -17,8 +17,8 @@ pub use decoder::{CodecInfo, DecodedStream, LoadCancel, classify_codec, is_http_
 pub use error::AudioError;
 pub use format::{
     GainRamp, PcmAdapter, PcmFrame, PcmSpec, SpscRingBuffer, VolumeCharacteristics, VolumeLevel,
-    apply_volume_in_place, apply_volume_with_characteristics, channel_gains, pcm_be_into_f32,
-    pcm_be_to_f32, songcast_pcm_be_into_f32, songcast_pcm_be_to_f32, volume_gain,
-    volume_gain_with_chars,
+    apply_volume_in_place, apply_volume_with_characteristics, channel_gains, f32_into_pcm_be,
+    f32_to_pcm_be, pcm_be_into_f32, pcm_be_to_f32, songcast_pcm_be_into_f32,
+    songcast_pcm_be_to_f32, volume_gain, volume_gain_with_chars,
 };
 pub use sink::{AudioSink, CaptureSink, NullSink, SinkStream};

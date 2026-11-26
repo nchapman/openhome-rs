@@ -21,6 +21,7 @@ struct CliArgs {
     songcast_interface: Ipv4Addr,
     device: String,
     disable_ssdp: bool,
+    disable_sender: bool,
     help: bool,
 }
 
@@ -39,6 +40,7 @@ impl CliArgs {
             songcast_interface: Ipv4Addr::UNSPECIFIED,
             device: "default".into(),
             disable_ssdp: false,
+            disable_sender: false,
             help: false,
         };
 
@@ -64,6 +66,7 @@ impl CliArgs {
                 }
                 "--device" => out.device = args.next().ok_or("--device requires a value")?,
                 "--no-ssdp" => out.disable_ssdp = true,
+                "--no-sender" => out.disable_sender = true,
                 "--help" | "-h" => {
                     out.help = true;
                     return Ok(out);
@@ -92,6 +95,7 @@ impl CliArgs {
             bind_addr: self.bind_addr,
             advertise_host: self.advertise_host,
             songcast_interface: self.songcast_interface,
+            enable_sender: !self.disable_sender,
             ssdp,
             sink,
             on_error: Some(Arc::new(|msg| {
@@ -108,7 +112,7 @@ async fn run_cli(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if cli.help {
         eprintln!(
-            "openhome-endpoint [--room NAME] [--name NAME] [--udn UDN] [--bind IP:PORT] [--advertise-host HOST] [--songcast-interface IPV4] [--device default|null|NAME] [--no-ssdp]"
+            "openhome-endpoint [--room NAME] [--name NAME] [--udn UDN] [--bind IP:PORT] [--advertise-host HOST] [--songcast-interface IPV4] [--device default|null|NAME] [--no-ssdp] [--no-sender]"
         );
         return Ok(());
     }
@@ -118,9 +122,10 @@ async fn run_cli(
     let endpoint = OpenHomeEndpoint::start(cli.into_config()).await?;
 
     eprintln!(
-        "openhome-endpoint listening on {} (room={room:?}, name={name:?}, description={})",
+        "openhome-endpoint listening on {} (room={room:?}, name={name:?}, description={}, sender={:?})",
         endpoint.local_addr(),
-        endpoint.description_url()
+        endpoint.description_url(),
+        endpoint.sender_uri()
     );
 
     shutdown.await;
@@ -179,6 +184,7 @@ mod tests {
             "--device",
             "null",
             "--no-ssdp",
+            "--no-sender",
         ])
         .unwrap();
         assert_eq!(cli.room, "Kitchen");
@@ -191,8 +197,10 @@ mod tests {
         assert_eq!(cli.advertise_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(cli.songcast_interface, Ipv4Addr::LOCALHOST);
         assert!(cli.disable_ssdp);
+        assert!(cli.disable_sender);
         let cfg = cli.into_config();
         assert_eq!(cfg.room, "Kitchen");
+        assert!(!cfg.enable_sender);
         (cfg.on_error.as_ref().expect("on_error"))("test diagnostic");
 
         let default_cfg = CliArgs::parse_from(["--device", "default"])
@@ -200,6 +208,7 @@ mod tests {
             .into_config();
         assert_eq!(default_cfg.room, "Living Room");
         assert_eq!(default_cfg.sink.name(), "cpal:default");
+        assert!(default_cfg.enable_sender);
 
         let named_cfg = CliArgs::parse_from(["--device", "DAC"])
             .unwrap()

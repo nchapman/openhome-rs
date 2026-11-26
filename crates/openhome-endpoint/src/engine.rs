@@ -5,17 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openhome_audio::{
-    AudioSink, DecodedStream, GainRamp, LoadCancel, PcmSpec, SinkStream,
+    AudioSink, DecodedStream, GainRamp, LoadCancel, PcmAdapter, PcmSpec, SinkStream,
     VolumeCharacteristics as AudioVolumeChars, VolumeLevel, channel_gains as audio_channel_gains,
-    pcm_be_into_f32,
+    f32_into_pcm_be, pcm_be_into_f32,
 };
 use openhome_core::types::{
     ReceiverState, TrackDetails, TransportState, VolumeCharacteristics, VolumeState,
 };
-use openhome_songcast::{ReceiverConfig, ReceiverEvent, SongcastReceiver, SongcastUri};
+use openhome_songcast::{
+    AudioFormat, ReceiverConfig, ReceiverEvent, SongcastReceiver, SongcastSender, SongcastUri,
+};
 use tokio::sync::mpsc as tokio_mpsc;
 
 fn channel_gains(state: &VolumeState, chars: &VolumeCharacteristics) -> (f32, f32) {
@@ -54,6 +56,8 @@ pub enum EngineCommand {
     Seek(u32),
     /// Update live volume/mute/balance gain.
     SetVolume(VolumeState),
+    /// Update the active Playlist track's URI and DIDL-Lite metadata for Songcast Sender broadcast.
+    SetTrackMetadata { uri: String, metadata: String },
     /// Start receiving and playing a Songcast stream (`ohm://`, `ohu://`, or `ohz://`).
     StartSongcast {
         generation: u64,
@@ -139,6 +143,25 @@ impl PlaybackEngine {
         allow_local_files: bool,
         volume_chars: VolumeCharacteristics,
     ) -> (Self, tokio_mpsc::UnboundedReceiver<EngineEvent>) {
+        Self::spawn_with_sender(
+            sink,
+            runtime,
+            latest_generation,
+            allow_local_files,
+            volume_chars,
+            None,
+        )
+    }
+
+    /// Spawn the playback worker with an optional [`SongcastSender`] for multiroom rebroadcasting.
+    pub fn spawn_with_sender(
+        sink: Arc<dyn AudioSink>,
+        runtime: tokio::runtime::Handle,
+        latest_generation: Arc<AtomicU64>,
+        allow_local_files: bool,
+        volume_chars: VolumeCharacteristics,
+        sender: Option<Arc<SongcastSender>>,
+    ) -> (Self, tokio_mpsc::UnboundedReceiver<EngineEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = tokio_mpsc::unbounded_channel();
         let worker_gen = Arc::clone(&latest_generation);
@@ -153,6 +176,7 @@ impl PlaybackEngine {
                     worker_gen,
                     allow_local_files,
                     volume_chars,
+                    sender,
                 )
             })
             .expect("spawn openhome-endpoint-worker");
@@ -226,7 +250,61 @@ struct ActiveSongcast {
     last_spec: Option<PcmSpec>,
     last_details: Option<TrackDetails>,
     playing: bool,
+    prebuffered: bool,
+    drift_adapter: Option<PcmAdapter>,
+    drift_scratch: Vec<f32>,
     last_reported_sec: u32,
+}
+
+/// Maximum silence pre-buffer lead applied to align the first Songcast audio packet to `playout_at`.
+const MAX_SONGCAST_PREBUFFER: Duration = Duration::from_millis(250);
+
+fn send_songcast_halt(
+    runtime: &tokio::runtime::Handle,
+    sender: &Option<Arc<SongcastSender>>,
+    last_fmt: &mut Option<AudioFormat>,
+) {
+    if let (Some(s), Some(fmt)) = (sender.as_ref(), last_fmt.take())
+        && s.active_receivers() > 0
+    {
+        let _ = runtime.block_on(s.send_audio(&fmt, Vec::new(), true));
+    }
+}
+
+fn broadcast_playlist_pcm(
+    runtime: &tokio::runtime::Handle,
+    sender: &Arc<SongcastSender>,
+    spec: PcmSpec,
+    stream: &DecodedStream,
+    samples: &[f32],
+    pcm_be_buf: &mut Vec<u8>,
+    last_fmt: &mut Option<AudioFormat>,
+) {
+    if sender.active_receivers() == 0 || samples.is_empty() || spec.sample_rate == 0 {
+        return;
+    }
+    let channels = (spec.channels.max(1) as u8).max(1);
+    let fmt = AudioFormat {
+        sample_rate: spec.sample_rate,
+        bit_depth: 16,
+        channels,
+        bit_rate: stream.bit_rate(),
+        lossless: stream.is_lossless(),
+        codec: stream.codec_name().to_string(),
+        volume_offset: 0,
+        samples_total: u64::from(stream.duration_secs()) * u64::from(spec.sample_rate),
+    };
+    *last_fmt = Some(fmt.clone());
+
+    // Chunk into ~5 ms UDP packets (matching ohSongcast OhmSenderDriver) so each packet fits MTU.
+    let frames_per_pkt = (spec.sample_rate as usize / 200).max(64);
+    let samples_per_pkt = frames_per_pkt * usize::from(channels);
+    for chunk in samples.chunks(samples_per_pkt) {
+        f32_into_pcm_be(chunk, 16, pcm_be_buf);
+        if !pcm_be_buf.is_empty() {
+            let _ = runtime.block_on(sender.send_audio(&fmt, pcm_be_buf.clone(), false));
+        }
+    }
 }
 
 fn shutdown_songcast_nonblocking(runtime: &tokio::runtime::Handle, sc: ActiveSongcast) {
@@ -238,6 +316,7 @@ fn shutdown_songcast_nonblocking(runtime: &tokio::runtime::Handle, sc: ActiveSon
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     sink_factory: Arc<dyn AudioSink>,
     runtime: tokio::runtime::Handle,
@@ -246,6 +325,7 @@ fn worker_loop(
     latest_generation: Arc<AtomicU64>,
     allow_local_files: bool,
     volume_chars: VolumeCharacteristics,
+    sender: Option<Arc<SongcastSender>>,
 ) {
     let default_vol = VolumeState {
         volume: 50,
@@ -260,6 +340,8 @@ fn worker_loop(
     let mut idle_sink: Option<Box<dyn SinkStream>> = None;
     let mut songcast: Option<ActiveSongcast> = None;
     let mut pcm_scratch: Vec<f32> = Vec::with_capacity(8192);
+    let mut sender_pcm_be: Vec<u8> = Vec::with_capacity(2048);
+    let mut last_sender_fmt: Option<AudioFormat> = None;
 
     loop {
         let is_active = track.as_ref().is_some_and(|t| !t.paused) || songcast.is_some();
@@ -279,12 +361,18 @@ fn worker_loop(
         if let Some(cmd) = next_cmd {
             match cmd {
                 EngineCommand::Shutdown => {
+                    send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                     drop(track);
                     drop(idle_sink);
                     if let Some(sc) = songcast.take() {
                         shutdown_songcast_nonblocking(&runtime, sc);
                     }
                     break;
+                }
+                EngineCommand::SetTrackMetadata { uri, metadata } => {
+                    if let Some(s) = sender.as_ref() {
+                        let _ = runtime.block_on(s.set_track(uri, metadata));
+                    }
                 }
                 EngineCommand::SetVolume(v) => {
                     let (lg, rg) = channel_gains(&v, &volume_chars);
@@ -295,6 +383,7 @@ fn worker_loop(
                     }
                 }
                 EngineCommand::Stop => {
+                    send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                     if let Some(mut t) = track.take() {
                         t.sink.flush();
                     }
@@ -306,6 +395,7 @@ fn worker_loop(
                     }
                 }
                 EngineCommand::DrainAndStop => {
+                    send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                     if let Some(mut t) = track.take() {
                         t.sink.drain();
                     }
@@ -325,6 +415,7 @@ fn worker_loop(
                     if let Some(t) = track.as_mut() {
                         t.paused = true;
                         t.sink.flush();
+                        send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                         let _ = ev_tx.send(EngineEvent::StateChanged {
                             generation: t.generation,
                             state: TransportState::Paused,
@@ -484,6 +575,7 @@ fn worker_loop(
                         continue;
                     }
 
+                    send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                     track = None;
                     drop(idle_sink.take());
                     if let Some(sc) = songcast.take() {
@@ -509,6 +601,9 @@ fn worker_loop(
                                         last_spec: None,
                                         last_details: None,
                                         playing: false,
+                                        prebuffered: false,
+                                        drift_adapter: None,
+                                        drift_scratch: Vec::new(),
                                         last_reported_sec: u32::MAX,
                                     });
                                 }
@@ -572,6 +667,19 @@ fn worker_loop(
                     }
 
                     let active = track.as_mut().unwrap();
+                    // Rebroadcast full-scale unity PCM to Songcast followers BEFORE local volume scaling
+                    // so every grouped room controls its own independent volume (matching ohPipeline).
+                    if let Some(s) = sender.as_ref() {
+                        broadcast_playlist_pcm(
+                            &runtime,
+                            s,
+                            spec,
+                            &active.stream,
+                            &pcm_scratch,
+                            &mut sender_pcm_be,
+                            &mut last_sender_fmt,
+                        );
+                    }
                     gain_ramp.apply(&mut pcm_scratch, spec.channels, spec.sample_rate);
                     if let Err(err) = active.sink.write(&pcm_scratch) {
                         let generation = active.generation;
@@ -638,10 +746,18 @@ fn worker_loop(
                 };
 
                 match ev {
-                    Some(ReceiverEvent::Audio { frame, .. }) => {
+                    Some(ReceiverEvent::Audio {
+                        frame,
+                        playout_at,
+                        skew_ppm,
+                    }) => {
                         if frame.flags.is_halt() {
                             if let Some(sink) = sc.sink.as_mut() {
                                 sink.flush();
+                            }
+                            sc.prebuffered = false;
+                            if let Some(adapter) = sc.drift_adapter.as_mut() {
+                                adapter.reset();
                             }
                             if sc.playing {
                                 sc.playing = false;
@@ -664,6 +780,8 @@ fn worker_loop(
                         if !sc.last_spec.is_some_and(|s| s.is_sink_compatible(&spec)) {
                             // Drop old sink BEFORE opening new one to avoid EBUSY on exclusive devices.
                             sc.sink = None;
+                            sc.prebuffered = false;
+                            sc.drift_adapter = None;
                             match sink_factory.open(spec) {
                                 Ok(s) => {
                                     sc.sink = Some(s);
@@ -726,11 +844,48 @@ fn worker_loop(
                             });
                         }
 
+                        // Pre-buffer silence up to `playout_at` on stream start / resync so the
+                        // first real Songcast sample hits the DAC at the scheduled multiroom instant
+                        // and absorbs initial network jitter.
+                        if !sc.prebuffered {
+                            sc.prebuffered = true;
+                            let lead = playout_at
+                                .saturating_duration_since(Instant::now())
+                                .min(MAX_SONGCAST_PREBUFFER);
+                            if lead >= Duration::from_millis(2)
+                                && let Some(sink) = sc.sink.as_mut()
+                            {
+                                let lead_frames =
+                                    ((lead.as_micros() * u128::from(spec.sample_rate)) / 1_000_000)
+                                        as usize;
+                                let silence_samples =
+                                    lead_frames * usize::from(spec.channels.max(1));
+                                if silence_samples > 0 {
+                                    pcm_scratch.clear();
+                                    pcm_scratch.resize(silence_samples, 0.0);
+                                    let _ = sink.write(&pcm_scratch);
+                                }
+                            }
+                        }
+
                         pcm_be_into_f32(&frame.audio, frame.bit_depth, &mut pcm_scratch);
                         if !pcm_scratch.is_empty() {
-                            gain_ramp.apply(&mut pcm_scratch, spec.channels, spec.sample_rate);
+                            // Apply gentle clock-drift compensation when sender skew exceeds 2 ppm.
+                            let out_samples: &mut [f32] =
+                                if skew_ppm.is_finite() && skew_ppm.abs() >= 2.0 {
+                                    let adapter = sc.drift_adapter.get_or_insert_with(|| {
+                                        PcmAdapter::new(spec, spec.sample_rate, spec.channels)
+                                    });
+                                    adapter.set_rate_adjust_ppm(skew_ppm);
+                                    adapter.process(&pcm_scratch, &mut sc.drift_scratch);
+                                    &mut sc.drift_scratch
+                                } else {
+                                    &mut pcm_scratch
+                                };
+
+                            gain_ramp.apply(out_samples, spec.channels, spec.sample_rate);
                             if let Some(sink) = sc.sink.as_mut()
-                                && let Err(err) = sink.write(&pcm_scratch)
+                                && let Err(err) = sink.write(out_samples)
                             {
                                 let generation = sc.generation;
                                 if let Some(sc_owned) = songcast.take() {
@@ -760,6 +915,10 @@ fn worker_loop(
                     Some(ReceiverEvent::Resynced) => {
                         if let Some(sink) = sc.sink.as_mut() {
                             sink.flush();
+                        }
+                        sc.prebuffered = false;
+                        if let Some(adapter) = sc.drift_adapter.as_mut() {
+                            adapter.reset();
                         }
                     }
                     None => {

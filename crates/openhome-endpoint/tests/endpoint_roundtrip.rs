@@ -157,8 +157,8 @@ async fn playlist_http_wav_playback_auto_advance_volume_and_controls() {
     let attrs = product.attributes().await.unwrap();
     assert!(attrs.info && attrs.time && attrs.volume && attrs.receiver);
     assert!(
-        !attrs.sender,
-        "Sender must not be advertised without SenderService"
+        attrs.sender,
+        "Sender is advertised when enable_sender is true (default)"
     );
     assert_eq!(product.source_xml_change_count().await.unwrap(), 0);
     let proto = playlist.protocol_info().await.unwrap();
@@ -1240,4 +1240,166 @@ async fn sme_regressions_realtime_songcast_gapless_drain_and_state_sync() {
     ep2.shutdown().await;
     http_task.abort();
     http_task2.abort();
+}
+
+/// Full multiroom OpenHome grouping test:
+/// Endpoint A ("Living Room", Songcast Sender) plays an HTTP WAV track on its Playlist
+/// and rebroadcasts full-scale unity PCM + DIDL-Lite metadata to Endpoint B ("Kitchen", Songcast Receiver).
+#[tokio::test]
+async fn multiroom_endpoint_leader_to_endpoint_follower_songcast_grouping() {
+    use openhome_core::types::SenderStatus;
+
+    let wav = synth_wav(44_100, 44_100 * 2, 0.5); // 2 seconds
+    let (http_addr, http_task) = spawn_wav_http_server(wav.clone(), wav).await;
+    let http_base = format!("http://{http_addr}");
+
+    let leader_sink = Arc::new(CaptureSink::realtime());
+    let follower_sink = Arc::new(CaptureSink::new());
+
+    let leader = OpenHomeEndpoint::start(EndpointConfig {
+        room: "Living Room".into(),
+        name: "Leader Endpoint".into(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        songcast_interface: Ipv4Addr::LOCALHOST,
+        enable_sender: true,
+        sink: leader_sink.clone(),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let follower = OpenHomeEndpoint::start(EndpointConfig {
+        room: "Kitchen".into(),
+        name: "Follower Endpoint".into(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        songcast_interface: Ipv4Addr::LOCALHOST,
+        enable_sender: false,
+        sink: follower_sink.clone(),
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+
+    assert!(leader.sender_uri().is_some());
+    assert!(follower.sender_uri().is_none());
+
+    let leader_dev = OpenHomeDevice::connect(leader.description_url())
+        .await
+        .unwrap();
+    let follower_dev = OpenHomeDevice::connect(follower.description_url())
+        .await
+        .unwrap();
+    assert!(
+        !follower_dev
+            .product()
+            .unwrap()
+            .attributes()
+            .await
+            .unwrap()
+            .sender
+    );
+
+    // Leader exposes Sender:1 with valid DIDL-Lite metadata containing its Songcast URI.
+    let sender_client = leader_dev.sender().expect("leader must expose Sender:1");
+    assert_eq!(sender_client.status().await.unwrap(), SenderStatus::Enabled);
+    assert!(!sender_client.audio().await.unwrap());
+    let sender_meta = sender_client.metadata().await.unwrap();
+    let sender_uri = leader.sender_uri().unwrap();
+    assert!(sender_meta.contains(sender_uri), "meta={sender_meta}");
+    assert!(sender_meta.contains("ohz:*:*:u"));
+    let _ = sender_client.presentation_url().await.unwrap();
+    let _ = sender_client.attributes().await.unwrap();
+
+    // Group Follower -> Leader via Receiver.SetSender + Receiver.Play.
+    let follower_rx = follower_dev.receiver().unwrap();
+    follower_rx
+        .set_sender(sender_uri, &sender_meta)
+        .await
+        .unwrap();
+    follower_rx.play().await.unwrap();
+
+    // Mute Leader locally so we verify Songcast rebroadcasts pre-volume unity PCM to Follower!
+    leader_dev.volume().unwrap().set_mute(true).await.unwrap();
+
+    let track_didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+                      xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+                      <item id=\"1\"><dc:title>Multiroom Jam</dc:title></item></DIDL-Lite>";
+    let leader_pl = leader_dev.playlist().unwrap();
+    leader_pl
+        .insert(0, &format!("{http_base}/track1.wav"), track_didl)
+        .await
+        .unwrap();
+    leader_pl.play().await.unwrap();
+
+    // Wait for Follower to receive PCM audio + track metadata and Leader Sender.Audio == true.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        let rx_state = follower_rx.transport_state().await.unwrap();
+        let has_audio = follower_sink
+            .frames()
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .any(|&s| s.abs() > 0.01);
+        let (_, f_meta) = follower_dev.info().unwrap().track().await.unwrap();
+        if rx_state == ReceiverState::Playing
+            && has_audio
+            && f_meta.contains("Multiroom Jam")
+            && sender_client.audio().await.unwrap()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        follower_rx.transport_state().await.unwrap(),
+        ReceiverState::Playing
+    );
+    assert!(
+        sender_client.audio().await.unwrap(),
+        "Leader Sender.Audio should be true while Playlist is playing"
+    );
+    assert!(
+        follower_sink
+            .frames()
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .any(|&s| s.abs() > 0.01),
+        "Follower must receive non-silent unity PCM even when Leader is locally muted"
+    );
+    let (_, f_meta) = follower_dev.info().unwrap().track().await.unwrap();
+    assert!(f_meta.contains("Multiroom Jam"), "got {f_meta}");
+
+    // Pausing Leader sends HALT -> Follower returns to Waiting and Sender.Audio becomes false.
+    leader_pl.pause().await.unwrap();
+    let deadline_halt = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline_halt {
+        if follower_rx.transport_state().await.unwrap() == ReceiverState::Waiting
+            && !sender_client.audio().await.unwrap()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        follower_rx.transport_state().await.unwrap(),
+        ReceiverState::Waiting
+    );
+    assert!(!sender_client.audio().await.unwrap());
+
+    // Standby disables Leader's Sender.Status.
+    leader_dev
+        .product()
+        .unwrap()
+        .set_standby(true)
+        .await
+        .unwrap();
+    assert_eq!(
+        sender_client.status().await.unwrap(),
+        SenderStatus::Disabled
+    );
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+    http_task.abort();
 }
