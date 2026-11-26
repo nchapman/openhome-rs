@@ -4,9 +4,10 @@
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, SERVER};
 use hyper::server::conn::http1;
@@ -22,6 +23,8 @@ use crate::dispatch::ServiceRegistry;
 use crate::event::{EventHub, SubscribeError};
 
 const MAX_SOAP_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum time allowed to read a single SOAP request body (guards against slowloris peers).
+const SOAP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
@@ -149,6 +152,17 @@ async fn handle_soap(
     slug: &str,
     state: HttpState,
 ) -> Response<Full<Bytes>> {
+    // Reject declared oversized bodies before reading so hostile peers cannot stall a task.
+    if let Some(cl) = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        && cl > MAX_SOAP_BODY_BYTES
+    {
+        return empty_response(StatusCode::PAYLOAD_TOO_LARGE, &state.server_header);
+    }
+
     let soap_action = req
         .headers()
         .get("soapaction")
@@ -156,9 +170,17 @@ async fn handle_soap(
         .map(str::to_string);
 
     let limited = Limited::new(req.into_body(), MAX_SOAP_BODY_BYTES);
-    let body_bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return empty_response(StatusCode::BAD_REQUEST, &state.server_header),
+    let body_bytes = match tokio::time::timeout(SOAP_BODY_READ_TIMEOUT, limited.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(err)) => {
+            let status = if err.is::<LengthLimitError>() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return empty_response(status, &state.server_header);
+        }
+        Err(_) => return empty_response(StatusCode::REQUEST_TIMEOUT, &state.server_header),
     };
     let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
         return empty_response(StatusCode::BAD_REQUEST, &state.server_header);
