@@ -280,13 +280,19 @@ fn broadcast_playlist_pcm(
     pcm_be_buf: &mut Vec<u8>,
     last_fmt: &mut Option<AudioFormat>,
 ) {
-    if sender.active_receivers() == 0 || samples.is_empty() || spec.sample_rate == 0 {
+    if sender.active_receivers() == 0
+        || samples.is_empty()
+        || spec.sample_rate == 0
+        || spec.channels == 0
+    {
         return;
     }
-    let channels = (spec.channels.max(1) as u8).max(1);
+    let channels = (spec.channels as u8).max(1);
+    // Preserve 24-bit PCM for hi-res sources (matching ohPipeline's 24-bit Songcast cap).
+    let bit_depth: u8 = if spec.bits_per_sample >= 24 { 24 } else { 16 };
     let fmt = AudioFormat {
         sample_rate: spec.sample_rate,
-        bit_depth: 16,
+        bit_depth,
         channels,
         bit_rate: stream.bit_rate(),
         lossless: stream.is_lossless(),
@@ -296,11 +302,14 @@ fn broadcast_playlist_pcm(
     };
     *last_fmt = Some(fmt.clone());
 
-    // Chunk into ~5 ms UDP packets (matching ohSongcast OhmSenderDriver) so each packet fits MTU.
-    let frames_per_pkt = (spec.sample_rate as usize / 200).max(64);
+    // Chunk into ~5 ms UDP packets capped at <=1360 payload bytes so high-rate / 24-bit
+    // streams (96 kHz / 192 kHz) stay below Ethernet MTU without IP fragmentation.
+    let bytes_per_frame = usize::from(channels) * usize::from(bit_depth / 8);
+    let mtu_max_frames = (1360 / bytes_per_frame.max(1)).max(1);
+    let frames_per_pkt = (spec.sample_rate as usize / 200).max(1).min(mtu_max_frames);
     let samples_per_pkt = frames_per_pkt * usize::from(channels);
     for chunk in samples.chunks(samples_per_pkt) {
-        f32_into_pcm_be(chunk, 16, pcm_be_buf);
+        f32_into_pcm_be(chunk, bit_depth, pcm_be_buf);
         if !pcm_be_buf.is_empty() {
             let _ = runtime.block_on(sender.send_audio(&fmt, pcm_be_buf.clone(), false));
         }
@@ -436,6 +445,7 @@ fn worker_loop(
                         match t.stream.seek(secs) {
                             Ok(actual) => {
                                 t.sink.flush();
+                                send_songcast_halt(&runtime, &sender, &mut last_sender_fmt);
                                 t.frames_played =
                                     u64::from(actual) * u64::from(t.stream.spec().sample_rate);
                                 t.last_reported_sec = actual;

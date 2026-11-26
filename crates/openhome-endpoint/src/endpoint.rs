@@ -253,6 +253,7 @@ impl EndpointCore {
                 } else {
                     self.loaded_track_id.store(0, Ordering::Release);
                     self.engine.send(EngineCommand::DrainAndStop);
+                    self.sync_sender_state();
                 }
                 self.notify_playback();
             }
@@ -300,6 +301,7 @@ impl EndpointCore {
                 self.loaded_track_id.store(0, Ordering::Release);
                 let _ = PlaylistService::stop(&self.state);
                 self.state.set_receiver_state(ReceiverState::Stopped);
+                self.sync_sender_state();
                 self.notify_playback();
                 self.notify_receiver_and_info();
             }
@@ -372,6 +374,7 @@ impl PlaylistService for EndpointCore {
     fn pause(&self) -> ActionResult<()> {
         self.state.pause()?;
         self.engine.send(EngineCommand::Pause);
+        self.sync_sender_state();
         Ok(())
     }
 
@@ -629,6 +632,7 @@ impl ReceiverService for EndpointCore {
             self.state.set_receiver_state(ReceiverState::Stopped);
             self.stop_engine();
         }
+        self.sync_sender_state();
         Ok(())
     }
 
@@ -636,6 +640,7 @@ impl ReceiverService for EndpointCore {
         ReceiverService::stop(&self.state)?;
         self.next_generation();
         self.engine.send(EngineCommand::StopSongcast);
+        self.sync_sender_state();
         Ok(())
     }
 

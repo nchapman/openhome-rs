@@ -325,7 +325,7 @@ pub fn songcast_pcm_be_into_f32(bytes: &[u8], bit_depth: u8, out: &mut Vec<f32>)
 }
 
 /// Convert interleaved normalized `f32` samples (`-1.0..=1.0`) into big-endian signed integer
-/// PCM bytes (`bit_depth` of `16` or `24`) for Songcast `OhmAudio` transmission.
+/// PCM bytes (`bit_depth` of `16`, `24`, or `32`) for Songcast `OhmAudio` transmission.
 pub fn f32_to_pcm_be(samples: &[f32], bit_depth: u8) -> Vec<u8> {
     let mut out = Vec::new();
     f32_into_pcm_be(samples, bit_depth, &mut out);
@@ -360,6 +360,18 @@ pub fn f32_into_pcm_be(samples: &[f32], bit_depth: u8, out: &mut Vec<u8>) {
                 let v = (clean * 8_388_607.0).round() as i32;
                 let be = v.to_be_bytes();
                 out.extend_from_slice(&be[1..4]);
+            }
+        }
+        32 => {
+            out.reserve(samples.len() * 4);
+            for &s in samples {
+                let clean = if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let v = (f64::from(clean) * 2_147_483_647.0).round() as i32;
+                out.extend_from_slice(&v.to_be_bytes());
             }
         }
         _ => {}
@@ -729,6 +741,12 @@ mod tests {
         assert_eq!(dec24.len(), 2);
         assert!((dec24[0] - 0.25).abs() < 1e-5);
         assert!((dec24[1] + 0.25).abs() < 1e-5);
+
+        let enc32 = f32_to_pcm_be(&[0.5, -0.5], 32);
+        let dec32 = pcm_be_to_f32(&enc32, 32);
+        assert_eq!(dec32.len(), 2);
+        assert!((dec32[0] - 0.5).abs() < 1e-6);
+        assert!((dec32[1] + 0.5).abs() < 1e-6);
         assert!(f32_to_pcm_be(&[0.5], 8).is_empty());
     }
 
